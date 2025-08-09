@@ -4,9 +4,17 @@ from functools import partial
 from jax.scipy.stats.norm import cdf as normal_cdf
 import numpy as np
 import dataclasses
+from diffcg.util.math import high_precision_sum
 from diffcg.common.geometry import angle, dihedral, vectorized_angle_fn, vectorized_dihedral_fn, distance
 from diffcg.common.periodic import displacement
-from diffcg.util.math import high_precision_sum
+
+def box_volume(box, ndim):
+    """Computes the volume of the simulation box"""
+    if box.size == ndim:
+        return jnp.prod(box)
+    elif box.ndim == 2:  # box tensor
+        signed_volume = jnp.linalg.det(box)
+        return jnp.abs(signed_volume)
 
 @dataclasses.dataclass
 class RDFParams:
@@ -114,7 +122,7 @@ def bdf_discretization(BDF_cut, nbins=300, BDF_start=0.):
     sigma_BDF = jnp.array(dx_bin)
     return bdf_bin_centers, bdf_bin_boundaries, sigma_BDF
 
-def initialize_bond_distribution_fun(box, displacement_fn, bdf_params):
+def initialize_bond_distribution_fun(bdf_params):
     """
     Initializes a function that computes the radial distribution function (RDF) for a single state.
     
@@ -127,39 +135,28 @@ def initialize_bond_distribution_fun(box, displacement_fn, bdf_params):
         A function that takes a simulation state and returns the instantaneous rdf
     """
     _, bdf_bin_centers, bdf_bin_boundaries, sigma, bond_top = dataclasses.astuple(bdf_params)
-    distance_metric = space.metric(displacement_fn)
     bin_size = jnp.diff(bdf_bin_boundaries)
 
-    def bond_corr_fun(R, **dynamic_kwargs):
+    def bond_corr_fun(system, **dynamic_kwargs):
         # computes instantaneous pair correlation function ensuring each particle pair contributes exactly 1
-        n_particles = R.shape[0]
-        metric = partial(distance_metric, **dynamic_kwargs)
-        metric = space.map_bond(metric)
-        dr = metric(R[bond_top[:,0],:], R[bond_top[:,1],:])
+        positions = system.R
+        Ra = positions[bond_top[:,0],:]
+        Rb = positions[bond_top[:,1],:]
+        edges = vmap(partial(displacement, system.cell))(Ra, Rb)
+        dr=vmap(distance)(edges)
         #  Gaussian distribution ensures that discrete integral over distribution is 1
-        exp = jnp.exp(-util.f32(0.5) * (dr[:, jnp.newaxis] - bdf_bin_centers) ** 2 / sigma ** 2)  # Gaussian exponent
+        exp = jnp.exp(-0.5 * (dr[:, jnp.newaxis] - bdf_bin_centers) ** 2 / sigma ** 2)  # Gaussian exponent
         gaussian_distances = exp * bin_size / jnp.sqrt(2 * jnp.pi * sigma ** 2)
-        bond_corr = util.high_precision_sum(gaussian_distances, axis=0)  # sum over all neighbors
+        bond_corr = high_precision_sum(gaussian_distances, axis=0)  # sum over all neighbors
         mean_bond_corr = bond_corr / jnp.trapz(bond_corr, bdf_bin_centers)
         return mean_bond_corr
 
-    def bdf_compute_fun(state, **unused_kwargs):
+    def bdf_compute_fun(system, **unused_kwargs):
         # Note: we cannot use neighborlist as RDF cutoff and neighborlist cut-off don't coincide in general
-        R = state.position
-        n_particles, spatial_dim = R.shape
-        bdf = bond_corr_fun(R)
+        bdf = bond_corr_fun(system)
         return bdf
     return bdf_compute_fun
 
-
-def box_volume(box, ndim):
-    """Computes the volume of the simulation box"""
-    if box.size == ndim:
-        return jnp.prod(box)
-    elif box.ndim == 2:  # box tensor
-        signed_volume = jnp.linalg.det(box)
-        return jnp.abs(signed_volume)
-   
 def initialize_radial_distribution_fun(box, displacement_fn, rdf_params):
     """
     Initializes a function that computes the radial distribution function (RDF) for a single state.
@@ -230,12 +227,19 @@ def initialize_inter_radial_distribution_fun(inter_rdf_params):
         # computes instantaneous pair correlation function ensuring each particle pair contributes exactly 1
         positions = system.R
         n_particles = positions.shape[0]
-        edges = vmap(partial(displacement, system.cell))(positions, positions)
-        dr=vmap(distance)(edges)
-        dr=dr*exclude_mask # exclude particles belong to the same molecule
-        dr = jnp.where(dr > 1.e-7, dr, 1.e7)  # neglect same particles i.e. distance = 0.
 
-        #  Gaussian distribution ensures that discrete integral over distribution is 1
+        # Compute all pairwise displacement vectors
+        disp_fn = partial(displacement, system.cell)
+        # (N, N, D)
+        disp_matrix = vmap(lambda x: vmap(lambda y: disp_fn(x, y))(positions))(positions)
+        # Compute all pairwise distances (N, N)
+        dr = vmap(lambda row: vmap(distance)(row))(disp_matrix)
+
+        # Exclude self-pairs and pairs to be masked
+        mask = (1.0 - jnp.eye(n_particles)) * exclude_mask  # 0 for self, 1 for valid pairs, 0 for excluded
+        dr = dr * mask + (1.0 - mask) * 1e7  # set excluded/self pairs to large value
+
+        # Gaussian distribution ensures that discrete integral over distribution is 1
         exp = jnp.exp(-0.5 * (dr[:, :, jnp.newaxis] - rdf_bin_centers) ** 2 / sigma ** 2)  # Gaussian exponent
         gaussian_distances = exp * bin_size / jnp.sqrt(2 * jnp.pi * sigma ** 2)
         pair_corr_per_particle = high_precision_sum(gaussian_distances, axis=1)  # sum over all neighbors
@@ -255,10 +259,8 @@ def initialize_inter_radial_distribution_fun(inter_rdf_params):
         # Note: we cannot use neighborlist as RDF cutoff and neighborlist cut-off don't coincide in general
         R = system.R
         n_particles = R.shape[0]
-        
         total_vol = box_volume(system.cell, system.R.shape[1])  # volume of partition
         mean_pair_corr = pair_corr_fun(system)
-            
         particle_density = n_particles / total_vol
         rdf = mean_pair_corr / norming_factors(particle_density, rdf_bin_boundaries)
         return rdf
@@ -301,7 +303,7 @@ def adf_discretization(ADF_cut, nbins=300, ADF_start=0.):
     return adf_bin_centers, adf_bin_boundaries, sigma_ADF
 
 
-def initialize_angle_distribution_fun(adf_params):
+def initialize_angle_distribution_fun( adf_params):
     """
     Initializes a function that computes the angular distribution function (ADF) for a single state.
 
@@ -331,9 +333,7 @@ def initialize_angle_distribution_fun(adf_params):
 
     def angle_corr_fun(system):
         """Compute adf contribution of each triplet."""
-
         positions = system.R
-
         R_kj = vmap(partial(displacement, system.cell))(positions[angle_top[:,2]],positions[angle_top[:,1]])
         R_ij = vmap(partial(displacement, system.cell))(positions[angle_top[:,0]],positions[angle_top[:,1]])
 
@@ -416,24 +416,23 @@ def initialize_dihedral_distribution_fun(ddf_params):
     _, adf_bin_centers, adf_bin_boundaries, sigma_theta, angle_top = dataclasses.astuple(ddf_params)
     bin_size = jnp.diff(adf_bin_boundaries)
 
-    def angle_corr_fun(system):
+    def dihedral_corr_fun(system):
         """Compute adf contribution of each triplet."""
 
         positions = system.R
-        R_ab=displacement(system.cell, positions[angle_top[:,0],:], positions[angle_top[:,1],:])
-        R_bc=displacement(system.cell, positions[angle_top[:,1],:], positions[angle_top[:,2],:])
-        R_cd=displacement(system.cell, positions[angle_top[:,2],:], positions[angle_top[:,3],:])
-        angles = vectorized_dihedral_fn(R_ab, R_bc, R_cd)
-        
-        exponent = jnp.exp(-util.f32(0.5) * (angles[:, jnp.newaxis] - adf_bin_centers) ** 2 / sigma_theta ** 2)
-        gaussians = exponent * bin_size / jnp.sqrt(2 * jnp.pi * sigma_theta ** 2)
-        unnormed_adf = util.high_precision_sum(gaussians, axis=0)
-        adf = unnormed_adf / jnp.trapz(unnormed_adf, adf_bin_centers)
-        return adf
+        R_cd = vmap(partial(displacement, system.cell))(positions[angle_top[:,3]],positions[angle_top[:,2]])
+        R_bc = vmap(partial(displacement, system.cell))(positions[angle_top[:,2]],positions[angle_top[:,1]])
+        R_ab = vmap(partial(displacement, system.cell))(positions[angle_top[:,1]],positions[angle_top[:,0]])
 
-    def adf_fn(state, **unused_kwargs):
-        R = state.position
-        n_particles, spatial_dim = R.shape
-        adf = angle_corr_fun(R)
-        return adf
-    return adf_fn
+        dihedrals = vectorized_dihedral_fn(R_ab, R_bc, R_cd)
+        
+        exponent = jnp.exp(-0.5 * (dihedrals[:, jnp.newaxis] - adf_bin_centers) ** 2 / sigma_theta ** 2)
+        gaussians = exponent * bin_size / jnp.sqrt(2 * jnp.pi * sigma_theta ** 2)
+        unnormed_adf = high_precision_sum(gaussians, axis=0)
+        ddf = unnormed_adf / jnp.trapz(unnormed_adf, adf_bin_centers)
+        return ddf
+
+    def ddf_fn(system, **unused_kwargs):
+        ddf = dihedral_corr_fun(system)
+        return ddf
+    return ddf_fn

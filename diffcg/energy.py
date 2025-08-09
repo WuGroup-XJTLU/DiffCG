@@ -6,11 +6,9 @@ from functools import partial,wraps
 from jax import vmap
 import jax
 from diffcg.util import custom_interpolate
-from diffcg.util.geometry import distance
-from diffcg.md.calculator import displacement
-
+from diffcg.common.geometry import distance, vectorized_angle_fn, vectorized_dihedral_fn
+from diffcg.common.periodic import displacement
 from diffcg.util.math import high_precision_sum
-from diffcg.util.geometry import vectorized_angle_fn, vectorized_dihedral_fn
 
 def tabulated(dr: jnp.ndarray, spline: Callable[[jnp.ndarray], jnp.ndarray], **unused_kwargs
               ) -> jnp.ndarray:

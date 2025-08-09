@@ -1,7 +1,19 @@
 from ase import Atoms
 import numpy as np
 import pickle
-
+from ase import Atoms, units
+from ase.calculators.calculator import (
+    BaseCalculator,
+    Calculator,
+    all_changes,
+    all_properties,
+)
+from ase.md.langevin import Langevin
+from ase.md.nvtberendsen import NVTBerendsen
+from ase.md.npt import NPT
+from ase.md.nptberendsen import Inhomogeneous_NPTBerendsen, NPTBerendsen, NVTBerendsen
+from ase.md.velocitydistribution import MaxwellBoltzmannDistribution, Stationary
+from ase.md.verlet import VelocityVerlet
 
 class TrajectoryObserver:
     """Trajectory observer is a hook in the relaxation process that saves the
@@ -67,23 +79,23 @@ class MolecularDynamics:
 
     def __init__(
         self,
-        atoms: Atoms | Structure,
+        atoms: Atoms,
         *,
         custom_calculator,
         ensemble: str = "nvt",
         thermostat: str = "Berendsen_inhomogeneous",
         temperature: int = 300,
-        starting_temperature: int | None = None,
+        starting_temperature = None,
         timestep: float = 2.0,
         pressure: float = 1.01325e-4,
-        taut: float | None = None,
-        taup: float | None = None,
-        bulk_modulus: float | None = None,
-        trajectory: str | Trajectory | None = None,
-        logfile: str | None = None,
+        taut = None,
+        taup = None,
+        bulk_modulus = None,
+        trajectory = None,
+        logfile = None,
         loginterval: int = 1,
         append_trajectory: bool = False,
-        use_device: str | None = None,
+        use_device = None,
         **dynamic_kwargs,
     ) -> None:
         """Initialize the MD class.
@@ -154,9 +166,6 @@ class MolecularDynamics:
         """
         self.ensemble = ensemble
         self.thermostat = thermostat
-        if isinstance(atoms, Structure | Molecule):
-            atoms = AseAtomsAdaptor().get_atoms(atoms)
-            # atoms = atoms.to_ase_atoms()
 
         if starting_temperature is not None:
             MaxwellBoltzmannDistribution(

@@ -12,59 +12,9 @@ from typing import Any
 
 from ase.calculators.calculator import Calculator
 
-try:
-    from glp.calculators.utils import strain_graph, get_strain
-    from glp import System, atoms_to_system
-    from glp.graph import system_to_graph
-except ImportError:
-    raise ImportError('Please install GLP package for running MD.')
+from diffcg.system import System, atoms_to_system
+from diffcg.common.neighborlist import neighbor_list
 
-SpatialPartitioning = namedtuple(
-    "SpatialPartitioning", ("allocate_fn", "update_fn", "cutoff", "skin", "capacity_multiplier")
-)
-
-
-def cast(x):
-    """Cast number literal to jnp.ndarray.
-
-    This avoids jit recompiles, as native python types
-    are "weak" types in jax. This makes everything explicit.
-    In high-precision situations, jax type promotion should™
-    do the right thing.
-    """
-
-    if type(x) == int:
-        return jnp.array(x, dtype=jnp.int32)
-    elif type(x) == float:
-        return jnp.array(x, dtype=jnp.float32)
-    else:
-        raise ValueError(f"cannot cast {x} of as type {type(x)} is unknown to me")
-
-def inverse(cell):
-    return jnp.linalg.inv(cell)
-
-
-def _to_frac(cell, R):
-    return jnp.einsum("Aa,a->A", inverse(cell), R)
-
-
-def to_frac(cell, R):
-    return vmap(partial(_to_frac, cell))(R)
-
-
-def _from_frac(cell, X):
-    return jnp.einsum("aA,A->a", cell, X)
-
-def displacement(cell, Ra, Rb):
-    if cell is None:
-        return Rb - Ra
-
-    else:
-        R = Rb - Ra
-        X = _to_frac(cell, R)
-        X = jnp.mod(X + cast(0.5), cast(1.0)) - cast(0.5)
-
-        return _from_frac(cell, X)
 
 def force(energy_fn: Callable) -> Callable:
   """Computes the force as the negative gradient of an energy."""
@@ -77,6 +27,9 @@ class CustomCalculator(Calculator):
 
     
         if calculate_stress:
+            # TODO: implement stress calculation
+            pass
+            """
             def energy_fn(system, strain: jnp.ndarray, neighbors):
                 graph = system_to_graph(system, neighbors)
                 graph = strain_graph(graph, strain)
@@ -89,6 +42,7 @@ class CustomCalculator(Calculator):
                 forces = - grads[0].R
                 stress = grads[1]/system.cell[0][0]**3 #only work for cubic box
                 return {'energy': energy, 'forces': forces, 'stress': stress}
+            """
         else:
             def energy_fn(system, neighbors):
                 return potentials(system, neighbors)
@@ -143,73 +97,4 @@ class CustomCalculator(Calculator):
         output = self.calculate_fn(System(R=R, Z=z, cell=cell), neighbors=neighbors)  # note different cell convention
         
         self.results = jax.tree_map(lambda x: np.array(x, dtype=self.dtype), output)
-
-
-def to_displacement(cell):
-    """
-    Returns function to calculate replacement. Returned function takes Ra and Rb as input and return Ra - Rb
-
-    Args:
-        cell ():
-
-    Returns:
-
-    """
-    from glp.periodic import make_displacement
-
-    displacement = make_displacement(cell)
-    # displacement(Ra, Rb) calculates Rb - Ra
-
-    # reverse sign convention bc feels more natural
-    return lambda Ra, Rb: displacement(Rb, Ra)
-
-@jax.jit
-def add_batch_dim(tree):
-    return jax.tree_map(lambda x: x[None], tree)
-
-
-@jax.jit
-def apply_neighbor_convention(tree):
-    idx_i = jnp.where(tree['idx_i'] < len(tree['z']), tree['idx_i'], -1)
-    idx_j = jnp.where(tree['idx_j'] < len(tree['z']), tree['idx_j'], -1)
-    tree['idx_i'] = idx_i
-    tree['idx_j'] = idx_j
-    return tree
-
-
-def neighbor_list(positions: jnp.ndarray, cutoff: float, skin: float, cell: jnp.ndarray = None,
-                  capacity_multiplier: float = 1.4):
-    """
-
-    Args:
-        positions ():
-        cutoff ():
-        skin ():
-        cell (): ASE cell.
-        capacity_multiplier ():
-
-    Returns:
-
-    """
-    try:
-        from glp.neighborlist import quadratic_neighbor_list
-    except ImportError:
-        raise ImportError('For neighborhood list, please install the glp package from ...')
-    # Convenience interface
-    # if cell is not None:
-    #     cell_T = cell.T
-    # else:
-    #     cell_T = None
-
-    allocate, update = quadratic_neighbor_list(
-        cell, cutoff, skin, capacity_multiplier=capacity_multiplier
-    )
-
-    neighbors = allocate(positions)
-
-    return neighbors, SpatialPartitioning(allocate_fn=allocate,
-                                          update_fn=jax.jit(update),
-                                          cutoff=cutoff,
-                                          skin=skin,
-                                          capacity_multiplier=capacity_multiplier)
 
