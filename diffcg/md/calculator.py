@@ -25,7 +25,6 @@ class CustomCalculator(Calculator):
     def __init__(self, potentials, calculate_stress=False, capacity_multiplier=1.25, dtype=jnp.float64, cutoff=1.0,skin=0.0):
         super().__init__()
 
-    
         if calculate_stress:
             # TODO: implement stress calculation
             pass
@@ -88,7 +87,7 @@ class CustomCalculator(Calculator):
                                                                       skin=0.,
                                                                       capacity_multiplier=self.capacity_multiplier)
 
-        neighbors = self.spatial_partitioning.update_fn(R, self.neighbors,new_cell=cell)
+        neighbors = self.spatial_partitioning.update_fn(R, self.neighbors, new_cell=cell)
         if neighbors.overflow:
             raise RuntimeError('Spatial overflow.')
         else:
@@ -97,4 +96,80 @@ class CustomCalculator(Calculator):
         output = self.calculate_fn(System(R=R, Z=z, cell=cell), neighbors=neighbors)  # note different cell convention
         
         self.results = jax.tree_map(lambda x: np.array(x, dtype=self.dtype), output)
+        
 
+class CustomEnergyCalculator(Calculator):
+    def __init__(self, potentials, calculate_stress=False, capacity_multiplier=1.25, dtype=jnp.float64, cutoff=1.0,skin=0.0):
+        super().__init__()
+
+        if calculate_stress:
+            # TODO: implement stress calculation
+            pass
+            """
+            def energy_fn(system, strain: jnp.ndarray, neighbors):
+                graph = system_to_graph(system, neighbors)
+                graph = strain_graph(graph, strain)
+                return potentials(graph).sum()
+
+            @jax.jit
+            def calculate_fn(system: System, neighbors):
+                strain = get_strain()
+                energy, grads = jax.value_and_grad(energy_fn, argnums=(0, 1), allow_int=True)(system, strain, neighbors)
+                forces = - grads[0].R
+                stress = grads[1]/system.cell[0][0]**3 #only work for cubic box
+                return {'energy': energy, 'forces': forces, 'stress': stress}
+            """
+        else:
+            def energy_fn(system, neighbors):
+                return potentials(system, neighbors)
+
+            @jax.jit
+            def calculate_fn(system, neighbors):
+                energy,_ = jax.value_and_grad(energy_fn, allow_int=True)(system, neighbors)
+                return energy
+
+        self.calculate_fn = calculate_fn
+
+        self.neighbors = None
+        self.spatial_partitioning = None
+        self.capacity_multiplier = capacity_multiplier
+
+        self.cutoff = cutoff
+
+        self.dtype = dtype
+        self.potential_energy = 0.0
+
+        self.implemented_properties = [
+                "energy",
+                "forces"
+            ]
+
+
+
+    def calculate(self, atoms=None, *args, **kwargs):
+        super(CustomEnergyCalculator, self).calculate(atoms, *args, **kwargs)
+
+        R = jnp.array(atoms.get_positions(), dtype=self.dtype)  # shape: (n,3)
+        z = jnp.array(atoms.get_atomic_numbers(), dtype=jnp.int16)  # shape: (n)
+
+        if atoms.get_pbc().any():
+            cell = jnp.array(np.array(atoms.get_cell()), dtype=self.dtype).T  # (3,3)
+        else:
+            cell = None
+        if self.spatial_partitioning is None:
+            self.neighbors, self.spatial_partitioning = neighbor_list(positions=R,
+                                                                      cell=cell,
+                                                                      cutoff=self.cutoff,
+                                                                      skin=0.,
+                                                                      capacity_multiplier=self.capacity_multiplier)
+
+        neighbors = self.spatial_partitioning.update_fn(R, self.neighbors,new_cell=cell)
+        if neighbors.overflow:
+            raise RuntimeError('Spatial overflow.')
+        else:
+            self.neighbors = neighbors
+
+        output = self.calculate_fn(System(R=R, Z=z, cell=cell), neighbors=neighbors)  # note different cell convention
+        #print(output)
+        self.results = output
+        
