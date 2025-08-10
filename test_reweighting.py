@@ -11,9 +11,17 @@ from jax import value_and_grad
 from diffcg.util import custom_quantity
 import pandas as pd
 from scipy import interpolate as sci_interpolate
-from diffcg.md.calculator import CustomCalculator
+from diffcg.md.calculator import CustomEnergyCalculator,CustomCalculator
 from ase import units
+from diffcg.learning.reweighting import ReweightEstimator
+import jax
+import warnings
+from diffcg.md.sample import MolecularDynamics
+# Suppress all UserWarnings
+warnings.filterwarnings("ignore", category=UserWarning)
 
+# Or suppress specific warning messages
+warnings.filterwarnings("ignore", message="specific warning text")
 Temperature=600
 
 def get_target_dict(temp):
@@ -116,13 +124,57 @@ def build_energy_fn_with_params(params,max_num_atoms=1):
 def rerun_energy(params, traj):
     results = []
     energy_fn = build_energy_fn_with_params(params,max_num_atoms=500)
-    calculator = CustomCalculator(energy_fn,cutoff=r_cut)
+    calculator = CustomEnergyCalculator(energy_fn,cutoff=r_cut)
     for atoms in traj:
         calculator.calculate(atoms)
-        results.append(calculator.results['energy'])
-    return results
+        results.append(calculator.results)
+        #print(results)
+    return jnp.stack(results)
 
 pretrained_params = np.load('pretrained_params.npy',allow_pickle=True).item()
 trajs = read('sample.traj',index=':')
 results = rerun_energy(pretrained_params, trajs)
-print(results)
+
+reweight_ratio = 0.95
+
+estimator = ReweightEstimator(results, base_energies=None, volume=None)
+
+# get loss & grad
+def loss(params):
+    energies = rerun_energy(params, trajs)
+    weight, n_eff = estimator.estimate_weight(energies)
+
+    return weight, n_eff
+
+
+weight, n_eff = estimator.estimate_weight(results)
+print(weight,n_eff)
+
+
+recompute = n_eff < reweight_ratio * len(trajs)
+
+print(recompute)
+
+# def md_sample(step,params,trajs):
+#     init_atoms = trajs[-1]
+#     sample_energy_fn = build_energy_fn_with_params(params,max_num_atoms=500)
+#     calculator = CustomCalculator(sample_energy_fn,cutoff=r_cut)
+#     sample_md = MolecularDynamics(init_atoms, 
+#                             custom_calculator=calculator, 
+#                             ensemble="nvt", 
+#                             thermostat="langevin", 
+#                             temperature=Temperature, 
+#                             starting_temperature=Temperature,
+#                             timestep=1.0, 
+#                             friction=0.01,
+#                             trajectory=f"sample{step}.traj",
+#                             logfile=f"sample{step}.log",
+#                             loginterval=100)
+#     sample_md.run(10000)
+
+# if recompute:   
+#     md_sample(0,pretrained_params,trajs)
+# else:
+#     print(recompute)
+
+# weight, n_eff = estimator.estimate_weight(results)
