@@ -59,7 +59,7 @@ class CustomCalculator(Calculator):
         self.capacity_multiplier = capacity_multiplier
 
         self.cutoff = cutoff
-
+        self.skin = skin
         self.dtype = dtype
         self.potential_energy = 0.0
 
@@ -84,7 +84,7 @@ class CustomCalculator(Calculator):
             self.neighbors, self.spatial_partitioning = neighbor_list(positions=R,
                                                                       cell=cell,
                                                                       cutoff=self.cutoff,
-                                                                      skin=0.,
+                                                                      skin=self.skin,
                                                                       capacity_multiplier=self.capacity_multiplier)
 
         neighbors = self.spatial_partitioning.update_fn(R, self.neighbors, new_cell=cell)
@@ -96,7 +96,9 @@ class CustomCalculator(Calculator):
         output = self.calculate_fn(System(R=R, Z=z, cell=cell), neighbors=neighbors)  # note different cell convention
         
         self.results = jax.tree_map(lambda x: np.array(x, dtype=self.dtype), output)
-        
+        if jnp.isnan(self.results['energy']):
+            raise RuntimeError('Energy is NaN.')
+
 
 class CustomEnergyCalculator(Calculator):
     def __init__(self, potentials, calculate_stress=False, capacity_multiplier=1.25, dtype=jnp.float64, cutoff=1.0,skin=0.0):

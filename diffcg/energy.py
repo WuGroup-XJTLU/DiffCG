@@ -90,7 +90,7 @@ def generic_repulsion(dr,
       Array of energies
     """
 
-    dr = jnp.where(dr > 1.e-7, dr, 1.e7)  # save masks dividing by 0
+    dr = jnp.where(dr > 1.e-8, dr, 1.e8)  # save masks dividing by 0
     idr = (sigma / dr)
     U = epsilon * idr ** exp
     return U
@@ -321,12 +321,14 @@ class HarmonicDihedralEnergy:
         return energy_fn
 
 class GenericRepulsionEnergy:
-    def __init__(self, sigma=0.6, epsilon=1., exp=8,mask_topology=None,max_num_atoms=None):
+    def __init__(self, sigma=0.6, epsilon=1., exp=8,mask_topology=None,max_num_atoms=None,r_onset=0.9,r_cutoff=1.0):
         self.sigma = sigma
         self.epsilon = epsilon
         self.exp = exp
         self.mask_topology = mask_topology
         self.max_num_atoms = max_num_atoms
+        self.r_onset = r_onset
+        self.r_cutoff = r_cutoff
 
     def get_energy_fn(self):
         if self.mask_topology is None:
@@ -339,11 +341,11 @@ class GenericRepulsionEnergy:
                 )
                 dr = vmap(distance)(edges)
                 
-                _energy = generic_repulsion(dr, self.sigma, self.epsilon, self.exp)
+                _energy = multiplicative_isotropic_cutoff(generic_repulsion, self.r_onset, self.r_cutoff)(dr, self.sigma, self.epsilon, self.exp)
                 mask = neighbors.centers != positions.shape[0]
                 
                 out = _energy * mask
-                return high_precision_sum(out)
+                return high_precision_sum(out) * 0.5
 
             return energy_fn
         else:
@@ -352,16 +354,21 @@ class GenericRepulsionEnergy:
                 nodes = system.Z
 
                 mask_centers,mask_others = mask_bonded_neighbors((neighbors.centers,neighbors.others),self.mask_topology,self.max_num_atoms)
-                mask = mask_centers != positions.shape[0]
-                
+                mask = mask_centers < positions.shape[0]
+                #for i in range(len(mask_centers)):
+                #    print(mask_centers[i],mask_others[i],neighbors.centers[i],neighbors.others[i])
+
                 edges = vmap(partial(displacement, system.cell))(
-                    positions[mask_centers], positions[mask_others]
+                    positions[neighbors.centers], positions[neighbors.others]
                 )
+                #for i in range(edges.shape[0]):
+                #    print(edges[i])
+
                 dr = vmap(distance)(edges)
                 
-                _energy = generic_repulsion(dr, self.sigma, self.epsilon, self.exp)
+                _energy = multiplicative_isotropic_cutoff(generic_repulsion, self.r_onset, self.r_cutoff)(dr, self.sigma, self.epsilon, self.exp)
                 out = _energy * mask
-                return high_precision_sum(out)
+                return high_precision_sum(out) * 0.5
 
             return energy_fn
     
@@ -395,7 +402,7 @@ class TabulatedPairEnergy:
                 
                 _energy = truncated_fn(dr)
                 out = _energy * mask
-                return high_precision_sum(out)
+                return high_precision_sum(out) * 0.5
 
             return energy_fn
         else:
@@ -404,10 +411,10 @@ class TabulatedPairEnergy:
                 nodes = system.Z
 
                 mask_centers,mask_others = mask_bonded_neighbors((neighbors.centers,neighbors.others),self.mask_topology,self.max_num_atoms)
-                mask = mask_centers != positions.shape[0]
+                mask = mask_centers < positions.shape[0]
                 
                 edges = vmap(partial(displacement, system.cell))(
-                    positions[mask_centers], positions[mask_others]
+                    positions[neighbors.centers], positions[neighbors.others]
                 )
                 dr = vmap(distance)(edges)
                 
@@ -416,6 +423,6 @@ class TabulatedPairEnergy:
                 
                 _energy = truncated_fn(dr)
                 out = _energy * mask
-                return high_precision_sum(out)
+                return high_precision_sum(out) * 0.5
 
             return energy_fn
