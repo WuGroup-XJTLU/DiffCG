@@ -1,9 +1,9 @@
 ## DiffCG: a JAX-based modular package for differentiable coarse-graining
 
-DiffCG provides building blocks for differentiable coarse-graining workflows in molecular simulation. It supports both top-down and bottom-up approaches and integrates tightly with ASE for running MD while leveraging JAX for automatic differentiation and JIT compilation.
+DiffCG provides building blocks for differentiable coarse-graining workflows in molecular simulation. It supports both top-down and bottom-up approaches and leverages JAX for automatic differentiation and JIT compilation.
 
-- **Top-down**: Iterative Boltzmann Inversion, Differentiable Molecular Dynamics
-- **Bottom-up**: Force Matching, Relative Entropy
+- **Top-down**: Iterative Boltzmann Inversion (IBI), Differentiable Simulation (DiffSim)
+- **Bottom-up**: Force Matching (FM), Relative Entropy (RE)
 
 
 ### Features
