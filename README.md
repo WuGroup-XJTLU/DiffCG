@@ -2,8 +2,7 @@
 
 DiffCG provides building blocks for differentiable coarse-graining workflows in molecular simulation. It supports both top-down and bottom-up approaches and leverages JAX for automatic differentiation and JIT compilation.
 
-- **Top-down**: Iterative Boltzmann Inversion (IBI), Differentiable Simulation (DiffSim)
-- **Bottom-up**: Force Matching (FM), Relative Entropy (RE)
+- Implemented methods: Iterative Boltzmann Inversion (IBI), Differentiable Simulation (DiffSim), Relative Entropy (RE) 
 
 
 ### Features
@@ -158,4 +157,7 @@ See `test_learning.py` for a full example of:
 
 Contributions are welcome. Please open issues/PRs with minimal reproducible examples when reporting bugs or proposing features.
 
+### Acknowlodge
+Difftre: https://github.com/tummfm/difftre
+glp: https://github.com/sirmarcel/glp
 
