@@ -2,7 +2,10 @@
 
 DiffCG provides building blocks for differentiable coarse-graining workflows in molecular simulation. It supports both top-down and bottom-up approaches and leverages JAX for automatic differentiation and JIT compilation.
 
-- Implemented methods: Iterative Boltzmann Inversion (IBI), Differentiable Simulation (DiffSim), Relative Entropy (RE) 
+Implemented methods: 
+- Iterative Boltzmann Inversion (IBI) 
+- Differentiable Simulation (DiffSim) 
+- Relative Entropy (RE) 
 
 
 ### Features
