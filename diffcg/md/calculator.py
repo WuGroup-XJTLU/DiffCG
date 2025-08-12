@@ -182,3 +182,17 @@ class CustomEnergyCalculator(Calculator):
         output = self.calculate_fn(System(R=R, Z=z, cell=cell), neighbors=neighbors)  # note different cell convention
         self.results = output
         
+def init_energy_calculator(energy_fn,cutoff=1.0,capacity_multiplier=1.25,dtype=jnp.float64):
+
+    def calculate_fn(system,**kwargs):
+        R = system.R
+        z = system.Z
+        cell = system.cell
+        neighbors, spatial_partitioning = neighbor_list(positions=R,
+                                                        cell=cell,
+                                                        cutoff=cutoff,
+                                                        skin=0.,
+                                                        capacity_multiplier=capacity_multiplier)
+        
+        return energy_fn(system, neighbors,**kwargs)
+    return calculate_fn

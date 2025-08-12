@@ -180,6 +180,8 @@ class MolecularDynamics:
 
         self.atoms.calc = custom_calculator
 
+        timestep = timestep * 0.1 # the length scale is in nm, the time unit is \AA \sqrt(u/eV), where AA is angstrom, u is atomic mass, and eV is energy unit
+
         if taut is None:
             taut = 100 * timestep
         if taup is None:

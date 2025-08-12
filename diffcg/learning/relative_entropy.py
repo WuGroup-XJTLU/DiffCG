@@ -1,65 +1,3 @@
-"""
-Relative Entropy (RE) training with importance reweighting (FEP).
-
-Overview
---------
-We fit CG parameters θ so that the model distribution
-
-    p_θ(X) = exp(−β U_θ(X)) / Z_θ
-
-matches the mapped atomistic (reference) distribution p_ref(X) in the sense of
-minimizing the KL divergence D_KL(p_ref || p_θ). Up to a constant independent of θ,
-this is equivalent to minimizing the convex objective
-
-    L(θ) = β E_{p_ref}[U_θ(X)] + log Z_θ.
-
-Directly differentiating log Z_θ requires expectations over p_θ. To avoid running a
-new CG simulation at every update, we employ free-energy perturbation (Zwanzig): for
-a base parameter set θ₀ with samples X ∼ p_{θ₀},
-
-    log Z_θ − log Z_{θ₀} = log E_{p_{θ₀}}[exp(−β (U_θ(X) − U_{θ₀}(X)))].
-
-Substituting gives the reweighting-based surrogate (up to constants):
-
-    L_RE(θ) = β E_{p_ref}[U_θ(X)] − log E_{p_{θ₀}}[exp(−β (U_θ(X) − U_{θ₀}(X)))].
-
-We estimate the two terms as follows:
-  - Reference term: run the energy U_θ on the (fixed) reference frames and take the sample mean.
-  - Normalizer term: run U_θ and U_{θ₀} on a short CG trajectory generated at θ₀,
-    then compute a numerically stable log-mean-exp of −β ΔU where ΔU = U_θ − U_{θ₀}.
-
-Gradient (conceptual)
----------------------
-The population RE gradient is
-
-    ∇_θ L(θ) = β ( E_{p_ref}[∂U_θ/∂θ] − E_{p_θ}[∂U_θ/∂θ] ).
-
-In practice we evaluate this by autodiff of the scalar loss L_RE(θ). The second term is
-implicitly estimated via the importance weights
-
-    w(X) ∝ exp(−β (U_θ(X) − U_{θ₀}(X))),    X ∼ p_{θ₀},
-
-which reweights θ₀-sampled frames towards p_θ. Effective sample size
-
-    n_eff = exp( −∑_j w_j log w_j )
-
-is tracked to detect weight degeneracy; when overlap between p_{θ₀} and p_θ is poor we
-refresh the CG trajectory at the current parameters.
-
-Step 0 behavior
----------------
-At the first iteration we initialize the CG trajectory at θ₀ = θ. Then ΔU = 0 on CG frames,
-the FEP term becomes log mean exp(0) = 0, weights are uniform, and the loss reduces to
-β times the mean energy on the reference frames (up to constants).
-
-Notes
------
-- The estimator is consistent but can be biased/variance-prone with poor overlap; the
-  n_eff-triggered refresh mitigates this by periodically re-sampling at the current θ.
-- Energies are evaluated via the provided JAX-differentiable energy builder, so gradients
-  flow through spline parameters or other differentiable terms.
-"""
-
 from typing import Dict
 
 import jax
@@ -67,12 +5,24 @@ import jax.numpy as jnp
 import optax
 import time
 import os
-
+from jax import lax
 from ase.io import read
 
 from diffcg.util.logger import get_logger
-from diffcg.md.calculator import CustomCalculator, CustomEnergyCalculator
+from diffcg.md.calculator import CustomCalculator, CustomEnergyCalculator, init_energy_calculator
+from diffcg.learning.reweighting import ReweightEstimator
+from diffcg.system import trj_atom_to_system, System
+from diffcg.common.neighborlist import neighbor_list
 
+def _tree_sum_batch(tree, axis: int = 0):
+    """Sum a batched pytree along a given axis for every leaf."""
+    return jax.tree_map(lambda x: jnp.sum(x, axis=axis), tree)
+
+def _tree_add(x, y):
+    return jax.tree_map(lambda a, b: a + b, x, y)
+
+def _tree_slice(tree, start: int, end: int):
+    return jax.tree_map(lambda x: x[start:end], tree)
 
 logger = get_logger(__name__)
 
@@ -150,7 +100,7 @@ def init_relative_entropy(
                 thermostat=sampler_params['thermostat'],
                 temperature=sampler_params['temperature'],
                 starting_temperature=sampler_params['starting_temperature'],
-                timestep=sampler_params['timestep'] * 0.1,
+                timestep=sampler_params['timestep'] ,
                 trajectory=None,
                 logfile=None,
                 loginterval=None,
@@ -162,7 +112,7 @@ def init_relative_entropy(
                 thermostat=sampler_params['thermostat'],
                 temperature=sampler_params['temperature'],
                 starting_temperature=sampler_params['starting_temperature'],
-                timestep=sampler_params['timestep'] * 0.1,
+                timestep=sampler_params['timestep'] ,
                 trajectory=f"{sampler_params['trajectory']}{step}.traj",
                 logfile=f"{sampler_params['logfile']}{step}.log",
                 loginterval=sampler_params['loginterval'],
@@ -177,7 +127,7 @@ def init_relative_entropy(
                 thermostat=sampler_params['thermostat'],
                 temperature=sampler_params['temperature'],
                 starting_temperature=sampler_params['starting_temperature'],
-                timestep=sampler_params['timestep'] * 0.1,
+                timestep=sampler_params['timestep'] ,
                 trajectory=f"{sampler_params['trajectory']}{step}.traj",
                 logfile=f"{sampler_params['logfile']}{step}.log",
                 loginterval=sampler_params['loginterval'],
@@ -227,61 +177,105 @@ def init_relative_entropy(
         # Base energies on CG frames under old params (reference for FEP)
         U_base_cg = rerun_energy(old_params, trajs_cg)
 
-        def wrapped_loss(p):
+        def energy_theta(params, system: System, neighbors, **kwargs):
+            """Energy evaluated by the underlying model with precomputed neighbors."""
+            _energy_fn = build_energy_fn_with_params_fn(params, max_num_atoms=max_num_atoms)
+            return _energy_fn(system, neighbors, **kwargs)
+
+        def weighted_gradient(system: System, neighbors, weight):
+            snapshot_grad = jax.grad(energy_theta)(params, system, neighbors)
+            return jax.tree_map(lambda g: weight * g, snapshot_grad)
+
+        reweight_estimator = ReweightEstimator(ref_energies=U_base_cg, kBT=temperature*Boltzmann_constant)
+        
+        ref_trajs_system = trj_atom_to_system(ref_trajs)
+        trajs_cg_system = trj_atom_to_system(trajs_cg)
+
+        def precompute_neighbors_batched(batched_system: System):
+            batch_size = batched_system.R.shape[0]
+            # Allocate on first frame to fix capacities; reuse for others via update_fn
+            sys0 = System(R=batched_system.R[0], Z=batched_system.Z[0], cell=batched_system.cell[0])
+            neighbors0, spatial_partitioning = neighbor_list(
+                positions=sys0.R,
+                cell=sys0.cell,
+                cutoff=state.get('r_cut', 1.0),
+                skin=0.0,
+                capacity_multiplier=1.5,
+            )
+            neighbors_list = [neighbors0]
+            for i in range(1, batch_size):
+                sys_i = System(R=batched_system.R[i], Z=batched_system.Z[i], cell=batched_system.cell[i])
+                nbrs_i = spatial_partitioning.update_fn(sys_i.R, neighbors0, new_cell=sys_i.cell)
+                neighbors_list.append(nbrs_i)
+            neighbors_batched = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs, axis=0), *neighbors_list)
+            return neighbors_batched
+
+        ref_neighbors = precompute_neighbors_batched(ref_trajs_system)
+        cg_neighbors = precompute_neighbors_batched(trajs_cg_system)
+
+        def re_gradient(p):
             # Reference contribution: β E_ref[U_θ]
             U_ref_theta = rerun_energy(p, ref_trajs)
-            term_ref = beta * jnp.mean(U_ref_theta)
+            ref_weights = jnp.ones(len(ref_trajs)) / (len(ref_trajs))
 
-            # Normalizer via FEP on CG proposal frames from base (old_params)
-            U_theta_cg = rerun_energy(p, trajs_cg)
-            delta = U_theta_cg - U_base_cg
-            term_norm = _logmeanexp(-beta * delta)
+            # Chunked vmap to control memory
+            def accumulate_batched(system_b, neighbors_b, weights_b, chunk_size: int = 32):
+                num = system_b.R.shape[0]
+                acc = None
+                for s in range(0, num, chunk_size):
+                    e = min(s + chunk_size, num)
+                    sys_chunk = _tree_slice(system_b, s, e)
+                    nbrs_chunk = _tree_slice(neighbors_b, s, e)
+                    w_chunk = weights_b[s:e]
+                    grads_chunk = jax.vmap(weighted_gradient)(sys_chunk, nbrs_chunk, w_chunk)
+                    grads_sum = _tree_sum_batch(grads_chunk, axis=0)
+                    acc = grads_sum if acc is None else _tree_add(acc, grads_sum)
+                return acc
 
-            loss_val = term_ref - term_norm
+            mean_ref_grad = accumulate_batched(ref_trajs_system, ref_neighbors, ref_weights)
 
-            # Diagnostics: effective sample size from FEP weights
-            w_unnorm = jnp.exp(-beta * delta - jnp.max(-beta * delta))
-            w = w_unnorm / jnp.sum(w_unnorm)
-            n_eff = jnp.exp(-jnp.sum(jnp.where(w > 1e-12, w * jnp.log(w), 0.0)))
+            energies_cg = rerun_energy(p, trajs_cg)
+            weights, n_eff = reweight_estimator.estimate_weight(energies_cg)
+            mean_gen_grad = accumulate_batched(trajs_cg_system, cg_neighbors, weights)
+
+            combine_grads = lambda x, y: beta * (x - y)
+            grad_val = jax.tree_map(combine_grads, mean_ref_grad, mean_gen_grad)
 
             metrics = {
-                'RE_loss': loss_val,
-                'term_ref': term_ref,
-                'term_norm': term_norm,
+                'RE_grad': grad_val,
                 'n_eff': n_eff,
                 'num_cg_frames': jnp.array(len(trajs_cg), dtype=jnp.float32),
                 'num_ref_frames': jnp.array(len(ref_trajs), dtype=jnp.float32),
             }
-            return loss_val, metrics
+            return grad_val, metrics
 
-        v_and_g = jax.value_and_grad(wrapped_loss, has_aux=True)
-        (loss_val, metrics), grad = v_and_g(params)
-
+        grad, metrics = re_gradient(params)
         scaled_grad, opt_state = optimizer.update(grad, opt_state, params)
         new_params = optax.apply_updates(params, scaled_grad)
-
+        
         # Decide whether to recompute trajectory for next step using n_eff heuristic (keep convention in reweighting.py)
         n_eff_val = float(metrics['n_eff'])
         recompute = (n_eff_val > reweight_ratio * len(trajs_cg)) and (step > 0)
         if recompute:
+            sample_energy_fn = build_energy_fn_with_params_fn(new_params, max_num_atoms=max_num_atoms)
             logger.info(
                 f"Recomputing trajectory {step} because n_eff = {n_eff_val} > {reweight_ratio * len(trajs_cg)}"
             )
-            new_atoms = trajs_cg[-1]
             os.system(f"rm {sampler_params['logfile']}{step}.log")
             md_objs = create_md(step, sample_energy_fn)
             if isinstance(md_objs, tuple):
                 md_equ, md_prod = md_objs
-                md_equ.set_atoms(new_atoms)
                 md_equ.run(scheme['equilibration_steps'])
                 md_prod.set_atoms(md_equ.atoms)
                 md_prod.run(scheme['production_steps'])
             else:
                 md = md_objs
-                md.set_atoms(new_atoms)
                 md.run(scheme['total_simulation_steps'])
 
-        return new_params, params, opt_state, loss_val, metrics
+        # Placeholder loss; compute actual RE loss if needed
+        leaves = jax.tree_util.tree_leaves(grad)
+        grad_norm = jnp.sqrt(sum(jnp.vdot(g, g) for g in leaves))
+        return new_params, params, opt_state, grad_norm, metrics
 
     return update_fn
 
@@ -290,33 +284,32 @@ def optimize_relative_entropy(update_fn, params, total_iterations):
     """Convenience optimizer loop for the RE update function.
 
     Returns:
-        loss_history, times_per_update, metrics_history, params_set
+        gradient_norm_history, times_per_update, metrics_history, params_set
     """
     new_params = params
     opt_state = None
-    loss_history = []
+    gradient_norm_history = []
     times_per_update = []
     metrics_history = []
     params_set = []
 
     for step in range(total_iterations):
         start_time = time.time()
-        new_params, params, opt_state, loss_val, metrics = update_fn(
+        new_params, params, opt_state, grad_norm, metrics = update_fn(
             step, new_params, params, opt_state
         )
         step_time = time.time() - start_time
         logger.info(
-            f"Step {step} in {step_time:0.2f} sec. RE Loss = {loss_val} | n_eff = {metrics.get('n_eff', jnp.nan)}\n\n"
+            f"Step {step} in {step_time:0.2f} sec. RE Grad Norm = {grad_norm} | n_eff = {metrics.get('n_eff', jnp.nan)}\n\n"
         )
-        if jnp.isnan(loss_val):
+        if jnp.isnan(grad_norm):
             logger.error(
                 'Loss is NaN. This was likely caused by divergence of the optimization or a bad model setup causing a NaN trajectory.'
             )
-        loss_history.append(loss_val)
+        gradient_norm_history.append(grad_norm)
         times_per_update.append(step_time)
         metrics_history.append(metrics)
         params_set.append(params)
 
-    return loss_history, times_per_update, metrics_history, params_set
-
+    return gradient_norm_history, times_per_update, metrics_history, params_set
 
