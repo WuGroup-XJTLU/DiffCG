@@ -4,6 +4,9 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional, Union
 import re
 from pathlib import Path
+from diffcg.util.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 class LAMMPSDataReader:
@@ -38,6 +41,7 @@ class LAMMPSDataReader:
             - dihedrals: numpy array of dihedral connections (shape: (n_dihedrals, 4))
             - dihedral_types: numpy array of dihedral types
         """
+        logger.info("Reading LAMMPS data from %s", self.filename)
         with open(self.filename, 'r') as f:
             lines = f.readlines()
         
@@ -85,6 +89,9 @@ class LAMMPSDataReader:
             self.data['dihedrals'] = dihedrals_data['dihedrals']
             self.data['dihedral_types'] = dihedrals_data['dihedral_types']
         
+        logger.debug("Parsed data: %s atoms, %s bonds, %s angles, %s dihedrals",
+                     header_info.get('n_atoms'), header_info.get('n_bonds'),
+                     header_info.get('n_angles'), header_info.get('n_dihedrals'))
         return self.data
     
     def _parse_header(self, lines: List[str]) -> Dict:
@@ -326,6 +333,7 @@ class LAMMPSDumpReader:
             - atom_numbs: list of atom counts per type
             - timesteps: list of timesteps
         """
+        logger.info("Reading LAMMPS dump from %s", self.filename)
         with open(self.filename, 'r') as f:
             content = f.read()
         
@@ -360,6 +368,7 @@ class LAMMPSDumpReader:
             'timesteps': timesteps
         }
         
+        logger.debug("Parsed dump: %s frames", len(timesteps))
         return self.data
     
     def _split_frames(self, content: str) -> List[str]:
@@ -530,11 +539,14 @@ def read_lammps_traj(filename: str) -> Dict:
     
     if 'LAMMPS' in first_line or 'atoms' in first_line:
         # This looks like a LAMMPS data file
+        logger.debug("Detected LAMMPS data format for %s", filename)
         return read_lammps_data(filename)
     elif 'ITEM: TIMESTEP' in first_line:
         # This looks like a LAMMPS dump file
+        logger.debug("Detected LAMMPS dump format for %s", filename)
         return read_lammps_dump(filename)
     else:
+        logger.error("Unknown LAMMPS file type for %s", filename)
         raise ValueError(f"Could not determine file type for {filename}")
 
 

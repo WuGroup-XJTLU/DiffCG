@@ -14,6 +14,9 @@ from ase.md.npt import NPT
 from ase.md.nptberendsen import Inhomogeneous_NPTBerendsen, NPTBerendsen, NVTBerendsen
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution, Stationary
 from ase.md.verlet import VelocityVerlet
+from diffcg.util.logger import get_logger
+
+logger = get_logger(__name__)
 
 class TrajectoryObserver:
     """Trajectory observer is a hook in the relaxation process that saves the
@@ -198,7 +201,7 @@ class MolecularDynamics:
                 loginterval=loginterval,
                 append_trajectory=append_trajectory,
             )
-            print("NVE-MD created")
+            logger.info("Created NVE MD: timestep=%s fs, loginterval=%s", timestep*10, loginterval)
 
         elif ensemble.lower() == "nvt":
             """
@@ -223,7 +226,7 @@ class MolecularDynamics:
                     loginterval=loginterval,
                     append_trajectory=append_trajectory,
                 )
-                print("NVT-Nose-Hoover MD created")
+                logger.info("Created NVT (Nose-Hoover) MD: T=%s K, timestep=%s fs", temperature, timestep*10)
             elif thermostat.lower() == "langevin":
                 self.dyn = Langevin(
                     atoms=self.atoms,
@@ -235,6 +238,7 @@ class MolecularDynamics:
                     loginterval=loginterval,
                     append_trajectory=append_trajectory
                 )
+                logger.info("Created NVT (Langevin) MD: T=%s K, timestep=%s fs", temperature, timestep*10)
             elif thermostat.lower().startswith("berendsen"):
                 """
                 Berendsen (constant N, V, T) molecular dynamics.
@@ -249,7 +253,7 @@ class MolecularDynamics:
                     loginterval=loginterval,
                     append_trajectory=append_trajectory,
                 )
-                print("NVT-Berendsen-MD created")
+                logger.info("Created NVT (Berendsen) MD: T=%s K, timestep=%s fs", temperature, timestep*10)
             else:
                 raise ValueError(
                     "Thermostat not supported, choose in 'Nose-Hoover', 'Berendsen', "
@@ -309,7 +313,7 @@ class MolecularDynamics:
                     loginterval=loginterval,
                     append_trajectory=append_trajectory,
                 )
-                print("NPT-Nose-Hoover MD created")
+                logger.info("Created NPT (Nose-Hoover) MD: T=%s K, P=%s GPa, timestep=%s fs", temperature, pressure, timestep*10)
 
             elif thermostat.lower() == "berendsen_inhomogeneous":
                 """
@@ -331,7 +335,7 @@ class MolecularDynamics:
                     logfile=logfile,
                     loginterval=loginterval,
                 )
-                print("NPT-Berendsen-inhomogeneous-MD created")
+                logger.info("Created NPT (Berendsen inhomogeneous) MD: T=%s K, P=%s GPa, timestep=%s fs", temperature, pressure, timestep*10)
 
             elif thermostat.lower() == "npt_berendsen":
                 """
@@ -355,7 +359,7 @@ class MolecularDynamics:
                     loginterval=loginterval,
                     append_trajectory=append_trajectory,
                 )
-                print("NPT-Berendsen-MD created")
+                logger.info("Created NPT (Berendsen) MD: T=%s K, P=%s GPa, timestep=%s fs", temperature, pressure, timestep*10)
             else:
                 raise ValueError(
                     "Thermostat not supported, choose in 'Nose-Hoover', 'Berendsen', "
@@ -373,7 +377,9 @@ class MolecularDynamics:
         Args:
             steps (int): number of MD steps
         """
+        logger.info("Running MD for %s steps", steps)
         self.dyn.run(steps)
+        logger.info("MD completed")
 
     def set_atoms(self, atoms: Atoms) -> None:
         """Set new atoms to run MD.

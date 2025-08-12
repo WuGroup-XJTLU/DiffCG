@@ -6,6 +6,9 @@ from typing import Dict, List, Optional, Union
 from pathlib import Path
 
 from diffcg.system import atoms_to_system
+from diffcg.util.logger import get_logger
+
+logger = get_logger(__name__)
 
 def read_ase_trj(filename: str) -> Dict:
     """
@@ -26,6 +29,7 @@ def read_ase_trj(filename: str) -> Dict:
     """
     # Read the trajectory using ASE
     from ase import io as ase_io
+    logger.info("Reading ASE trajectory from %s", filename)
     trajectory = ase_io.read(filename, index=':')
     
     # Handle single frame case
@@ -43,6 +47,7 @@ def read_ase_trj(filename: str) -> Dict:
         system = atoms_to_system(frame)
         systems.append(system)
     
+    logger.debug("Loaded %s frames from %s", len(systems), filename)
     return systems
 
 

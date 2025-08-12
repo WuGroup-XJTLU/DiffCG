@@ -14,6 +14,9 @@ from ase.calculators.calculator import Calculator
 
 from diffcg.system import System, atoms_to_system
 from diffcg.common.neighborlist import neighbor_list
+from diffcg.util.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 def force(energy_fn: Callable) -> Callable:
@@ -81,6 +84,7 @@ class CustomCalculator(Calculator):
         else:
             cell = None
         if self.spatial_partitioning is None:
+            logger.debug("Building neighbor list: cutoff=%s, skin=%s", self.cutoff, self.skin)
             self.neighbors, self.spatial_partitioning = neighbor_list(positions=R,
                                                                       cell=cell,
                                                                       cutoff=self.cutoff,
@@ -89,6 +93,7 @@ class CustomCalculator(Calculator):
 
         neighbors = self.spatial_partitioning.update_fn(R, self.neighbors, new_cell=cell)
         if neighbors.overflow:
+            logger.error('Neighbor list overflow detected')
             raise RuntimeError('Spatial overflow.')
         else:
             self.neighbors = neighbors
@@ -97,6 +102,7 @@ class CustomCalculator(Calculator):
         
         self.results = jax.tree_map(lambda x: np.array(x, dtype=self.dtype), output)
         if jnp.isnan(self.results['energy']):
+            logger.error('NaN energy encountered')
             raise RuntimeError('Energy is NaN.')
 
 
@@ -159,6 +165,7 @@ class CustomEnergyCalculator(Calculator):
         else:
             cell = None
         if self.spatial_partitioning is None:
+            logger.debug("Building neighbor list (energy-only): cutoff=%s", self.cutoff)
             self.neighbors, self.spatial_partitioning = neighbor_list(positions=R,
                                                                       cell=cell,
                                                                       cutoff=self.cutoff,
@@ -167,11 +174,11 @@ class CustomEnergyCalculator(Calculator):
 
         neighbors = self.spatial_partitioning.update_fn(R, self.neighbors,new_cell=cell)
         if neighbors.overflow:
+            logger.error('Neighbor list overflow detected')
             raise RuntimeError('Spatial overflow.')
         else:
             self.neighbors = neighbors
 
         output = self.calculate_fn(System(R=R, Z=z, cell=cell), neighbors=neighbors)  # note different cell convention
-        #print(output)
         self.results = output
         
