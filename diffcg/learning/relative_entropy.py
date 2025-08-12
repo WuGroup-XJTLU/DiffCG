@@ -5,6 +5,8 @@ import jax.numpy as jnp
 import optax
 import time
 import os
+from shutil import copy2
+from pathlib import Path
 from jax import lax
 from ase.io import read
 
@@ -166,12 +168,8 @@ def init_relative_entropy(
             trajs_cg = read(f"{sampler_params['trajectory']}{step}.traj", index=':')
         else:
             logger.info(f"Reusing trajectory {step-1}")
-            os.system(
-                f"cp {sampler_params['trajectory']}{step-1}.traj {sampler_params['trajectory']}{step}.traj"
-            )
-            os.system(
-                f"cp {sampler_params['logfile']}{step-1}.log {sampler_params['logfile']}{step}.log"
-            )
+            copy2(f"{sampler_params['trajectory']}{step-1}.traj", f"{sampler_params['trajectory']}{step}.traj")
+            copy2(f"{sampler_params['logfile']}{step-1}.log", f"{sampler_params['logfile']}{step}.log")
             trajs_cg = read(f"{sampler_params['trajectory']}{step}.traj", index=':')
 
         # Base energies on CG frames under old params (reference for FEP)
@@ -261,7 +259,13 @@ def init_relative_entropy(
             logger.info(
                 f"Recomputing trajectory {step} because n_eff = {n_eff_val} > {reweight_ratio * len(trajs_cg)}"
             )
-            os.system(f"rm {sampler_params['logfile']}{step}.log")
+            try:
+                Path(f"{sampler_params['logfile']}{step}.log").unlink(missing_ok=True)
+            except TypeError:
+                # Python <3.8 compatibility
+                p = Path(f"{sampler_params['logfile']}{step}.log")
+                if p.exists():
+                    p.unlink()
             md_objs = create_md(step, sample_energy_fn)
             if isinstance(md_objs, tuple):
                 md_equ, md_prod = md_objs

@@ -1,10 +1,7 @@
-import numpy as np
+"""Deprecated module: kept for backward compatibility.
 
-def Boltzmann_Inversion(kbT,dist):
-  U_BI=-kbT*np.log(dist)
-  return U_BI
+Use `diffcg.util.boltzmann_inversion` instead.
+"""
 
-def get_target_dict(kbT, dist_dict):
-    U_BI=Boltzmann_Inversion(kbT,dist_dict['dist'])-Boltzmann_Inversion(kbT,dist_dict['dist'])[-1]
-    bin_centers=dist_dict['bin_centers']
-    return bin_centers, U_BI
+from .boltzmann_inversion import boltzmann_inversion as Boltzmann_Inversion  # noqa: N813
+from .boltzmann_inversion import get_target_from_distribution as get_target_dict  # noqa: F401
