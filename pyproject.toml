@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "diffcg"
+description = "A JAX-based modular package for differentiable coarse-graining"
+readme = "README.md"
+requires-python = ">=3.8"
+version = "0.1.0"
+license = "MIT"
+authors = [{ name = "Zhenghao Wu", email = "zhenghao.wu@xjtlu.edu.cn" }]
+maintainers = [{ name = "WuResearchGroup", email = "zhenghao.wu@xjtlu.edu.cn" }]
+keywords = ["coarse-graining", "molecular dynamics", "polymers"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Operating System :: OS Independent",
+  "Topic :: Scientific/Engineering :: Chemistry",
+  "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = [
+  "numpy>=1.23",
+  "scipy>=1.9",
+  "pandas>=1.5",
+  "ase>=3.22",
+  "chemfiles>=0.10",
+  "optax>=0.1.6",
+  "jax>=0.4.14",
+  "jaxlib>=0.4.14",
+]
+
+[project.urls]
+Homepage = "https://github.com/your-org/diffCG"
+Issues = "https://github.com/your-org/diffCG/issues"
+Documentation = "https://your-org.github.io/diffCG/"
+
+[project.optional-dependencies]
+examples = ["matplotlib>=3.6", "dpdata>=0.2"]
+dev = [
+  "build",
+  "twine",
+  "pytest",
+  "pytest-cov",
+  "pre-commit",
+  "ruff>=0.4",
+  "black>=24.3",
+  "mypy>=1.7",
+]
+docs = ["mkdocs-material", "mkdocstrings[python]"]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["diffcg*"]
+
+ 
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.black]
+line-length = 100
+target-version = ["py39"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+

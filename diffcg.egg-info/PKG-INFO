@@ -1,3 +1,47 @@
+Metadata-Version: 2.4
+Name: diffcg
+Version: 0.1.0
+Summary: A JAX-based modular package for differentiable coarse-graining
+Author-email: Zh <you@example.com>
+Maintainer-email: Your Team <team@example.com>
+License-Expression: MIT
+Project-URL: Homepage, https://github.com/your-org/diffCG
+Project-URL: Issues, https://github.com/your-org/diffCG/issues
+Project-URL: Documentation, https://your-org.github.io/diffCG/
+Keywords: coarse-graining,molecular dynamics,jax,ase
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3 :: Only
+Classifier: Operating System :: OS Independent
+Classifier: Topic :: Scientific/Engineering :: Chemistry
+Classifier: Topic :: Scientific/Engineering :: Physics
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: numpy>=1.23
+Requires-Dist: scipy>=1.9
+Requires-Dist: pandas>=1.5
+Requires-Dist: ase>=3.22
+Requires-Dist: chemfiles>=0.10
+Requires-Dist: optax>=0.1.6
+Requires-Dist: jax>=0.4.14
+Requires-Dist: jaxlib>=0.4.14
+Provides-Extra: examples
+Requires-Dist: matplotlib>=3.6; extra == "examples"
+Requires-Dist: dpdata>=0.2; extra == "examples"
+Provides-Extra: dev
+Requires-Dist: build; extra == "dev"
+Requires-Dist: twine; extra == "dev"
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: pytest-cov; extra == "dev"
+Requires-Dist: pre-commit; extra == "dev"
+Requires-Dist: ruff>=0.4; extra == "dev"
+Requires-Dist: black>=24.3; extra == "dev"
+Requires-Dist: mypy>=1.7; extra == "dev"
+Provides-Extra: docs
+Requires-Dist: mkdocs-material; extra == "docs"
+Requires-Dist: mkdocstrings[python]; extra == "docs"
+Dynamic: license-file
+
 ## DiffCG: a JAX-based modular package for differentiable coarse-graining
 
 DiffCG provides building blocks for differentiable coarse-graining workflows in molecular simulation. It supports both top-down and bottom-up approaches and leverages JAX for automatic differentiation and JIT compilation.
@@ -9,16 +53,23 @@ Implemented methods:
 
 ### Installation
 
-Create a conda virtual environment (recommended) and install from source:
+This repository is a monorepo. To use the `diffcg` package directly from source, either:
+
+1) Add the repo to your Python path (recommended during development):
 
 ```bash
-conda create -n diffcg python=3.8 && conda activate diffcg
-python -m pip install -e .
+export PYTHONPATH=/home/zhenghaowu/development/diffCG:$PYTHONPATH
 ```
 
-JAX note: JAX/JAXLIB wheels are accelerator- and platform-specific. If you
-need GPU/TPU support, please follow the official JAX guide for your platform
-([JAX installation guide](https://jax.readthedocs.io/en/latest/installation.html)).
+2) Or create a virtual environment and install dependencies manually:
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install jax jaxlib ase optax numpy scipy pandas matplotlib chemfiles
+```
+
+Note: JAX wheels are platform/accelerator specific. See the official JAX installation guide for your platform.
 
 
 ### Quickstart

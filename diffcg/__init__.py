@@ -21,7 +21,3 @@ try:
 except Exception:
     # Soft-fail if optional deps are missing during partial installs
     pass
-
-#from diffcg import configure_logging
-
-configure_logging(level="DEBUG")
