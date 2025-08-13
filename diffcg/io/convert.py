@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 WuResearchGroup
+
 from ase.io import read,write
 
 def ase2xyz(ase_traj,xyz_traj):

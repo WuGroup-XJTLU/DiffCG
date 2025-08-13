@@ -1,5 +1,8 @@
 """Common physical constants and unit conversions for diffcg.
 
+SPDX-License-Identifier: MIT
+Copyright (c) 2025 WuResearchGroup
+
 All constants are expressed in kJ, mol, K, nm, and bar where applicable to
 match the rest of the codebase conventions.
 """

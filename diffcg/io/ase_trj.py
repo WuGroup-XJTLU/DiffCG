@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 WuResearchGroup
+
 # this file implement the function to read the ase trajectory following the dpdata format (https://github.com/deepmodeling/dpdata/tree/master)
 
 import ase

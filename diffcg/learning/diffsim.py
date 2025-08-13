@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 WuResearchGroup
+
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
 from jax import value_and_grad

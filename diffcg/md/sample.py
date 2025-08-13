@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 WuResearchGroup
+
 from ase import Atoms
 import numpy as np
 import pickle

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 WuResearchGroup
+
 import jax.numpy as jnp
 from jax import lax
 from jax.tree_util import tree_map

@@ -1,3 +1,9 @@
+"""Low-level geometry helpers for distances, angles, and dihedrals.
+
+SPDX-License-Identifier: MIT
+Copyright (c) 2025 WuResearchGroup
+"""
+
 import jax.numpy as jnp
 from jax import vmap
 

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 WuResearchGroup
+
 """Custom definition of some potential energy functions."""
 from typing import Callable
 

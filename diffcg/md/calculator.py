@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 WuResearchGroup
+
 # define a general ASE calculator class that can use custom energy function to calculate the energy and force
 from functools import partial
 from typing import Callable, Union
