@@ -154,64 +154,6 @@ class DiffSim():
         return optimize_diffsim(update_fn, params, total_iteration)
     
 
-
-coweighting_stats = namedtuple("coweighting_stats", 
-                                ("current_iter", "num_losses", "mean_decay", "running_mean_L", "running_mean_l", "running_std_l", "running_S_l", "alphas"))
-
-def init_coweighting_stats(num_losses):
-    current_iter=-1
-    mean_decay=False
-    running_mean_L=jnp.zeros(num_losses)
-    running_mean_l=jnp.zeros(num_losses)
-    running_std_l=jnp.zeros(num_losses)
-    running_S_l=jnp.zeros(num_losses)
-    alphas=jnp.ones(num_losses)
-    
-    return coweighting_stats(current_iter,num_losses,mean_decay,running_mean_L,running_mean_l,running_std_l,running_S_l,alphas)
-
-def coweightingloss_init():
-
-    def coweightingloss(loss_dict,coweighting_stats):
-        L, unravel = ravel_pytree(loss_dict)
-        
-        current_iter,num_losses,mean_decay,running_mean_L,running_mean_l,running_std_l,running_S_l,alphas = coweighting_stats
-
-        # Increase the current iteration parameter.
-        current_iter += 1
-
-        L0=jnp.where(current_iter == 0, L, running_mean_L)
-
-        l = L/L0 #L / L0  
-
-        alphas=jnp.where(current_iter <=1, alphas / num_losses, (running_std_l / running_mean_L)/jnp.sum((running_std_l / running_mean_L)))
-
-        mean_param=jnp.where(current_iter==0,0.0,(1. - 1 / (current_iter + 1)))
-
-        x_l = l
-        new_mean_l = mean_param * running_mean_L + (1 - mean_param) * x_l
-        running_S_l += (x_l - running_mean_L) * (x_l - new_mean_l)
-        running_mean_L = new_mean_l
-
-        running_variance_l = running_S_l / (current_iter + 1)
-        running_std_l = jnp.sqrt(running_variance_l + 1e-8)
-
-        x_L = L
-        running_mean_L = mean_param * running_mean_L + (1 - mean_param) * x_L
-
-        weighted_losses = jnp.sum(L*alphas)
-
-        return weighted_losses,coweighting_stats._replace(
-                                                        current_iter=current_iter,
-                                                        num_losses=num_losses,
-                                                        mean_decay=mean_decay,
-                                                        running_mean_L=running_mean_L,
-                                                        running_mean_l=running_mean_l,
-                                                        running_std_l=running_std_l,
-                                                        running_S_l=running_S_l,
-                                                        alphas=alphas)
-
-    return coweightingloss
-
 def init_multistate_diffsim(
     *,
     reweight_ratio,
@@ -220,6 +162,7 @@ def init_multistate_diffsim(
     optimizer,
     Boltzmann_constant: float = 0.0083145107,
     state_weights: Optional[dict] = None,
+    multiobj = None,
 ):
     """
     Initialize a multistate DiffSim update function.
@@ -434,7 +377,14 @@ def init_multistate_diffsim(
             for sid in state_ids
         }
 
+        if multiobj == 'coweighting':
+            from diffcg.learning.multiobj import init_coweighting_stats, coweightingloss_init
+            coweighting_stats = init_coweighting_stats(len(state_ids))
+            coweighting_fn = coweightingloss_init()
+
         def wrapped_total_loss_fn(p):
+            if multiobj == 'coweighting':
+                nonlocal coweighting_stats  # Declare nonlocal at the beginning
             total = 0.0
             per_state_losses = {}
             predictions_by_state = {}
@@ -445,8 +395,17 @@ def init_multistate_diffsim(
                 loss_val, predictions = ctx['loss_fn'](observables_by_state[sid], weights)
                 predictions_by_state[sid] = predictions
                 per_state_losses[sid] = loss_val
-                total += state_weights.get(sid, 1.0) * loss_val
-            return total, (per_state_losses, predictions_by_state)
+                #total += state_weights.get(sid, 1.0) * loss_val
+            if multiobj == 'coweighting':
+                # Apply coweighting algorithm
+                total_loss, updated_stats = coweighting_fn(per_state_losses, coweighting_stats)
+                # Update the coweighting_stats for next iteration
+                coweighting_stats = updated_stats
+            else:
+                # Original simple weighted sum
+                total_loss = sum(state_weights.get(sid, 1.0) * loss_val 
+                                for sid, loss_val in per_state_losses.items())
+            return total_loss, (per_state_losses, predictions_by_state)
 
         v_and_g = value_and_grad(wrapped_total_loss_fn, has_aux=True)
         (total_loss, (per_state_losses, predictions_by_state)), grad = v_and_g(params)
@@ -610,8 +569,8 @@ def init_diffsim(
             trajs = read(f"{sampler_params['trajectory']}{step}.traj", index=':')
         else:
             logger.info(f"Reusing trajectory {step-1}")
-                copy2(f"{sampler_params['trajectory']}{step-1}.traj", f"{sampler_params['trajectory']}{step}.traj")
-                copy2(f"{sampler_params['logfile']}{step-1}.log", f"{sampler_params['logfile']}{step}.log")
+            copy2(f"{sampler_params['trajectory']}{step-1}.traj", f"{sampler_params['trajectory']}{step}.traj")
+            copy2(f"{sampler_params['logfile']}{step-1}.log", f"{sampler_params['logfile']}{step}.log")
             trajs = read(f"{sampler_params['trajectory']}{step}.traj", index=':')
 
         # Build estimator from reference energies with old_params
