@@ -360,25 +360,25 @@ class DDFParams:
     A struct containing hyperparameters to initialize a angle distribution (BDF) compute function.
 
     Attributes:
-    reference_adf: The target bdf; initialize with None if no target available
-    adf_bin_centers: The positions of the centers of the adf bins over theta
-    sigma_ADF: Standard deviation of smoothing Gaussian
+    reference_ddf: The target ddf; initialize with None if no target available
+    ddf_bin_centers: The positions of the centers of the ddf bins over theta
+    sigma_DDF: Standard deviation of smoothing Gaussian
     """
-    reference_adf: jnp.ndarray
-    adf_bin_centers: jnp.ndarray
-    adf_bin_boundaries: jnp.ndarray
-    sigma_ADF: jnp.ndarray
+    reference_ddf: jnp.ndarray
+    ddf_bin_centers: jnp.ndarray
+    ddf_bin_boundaries: jnp.ndarray
+    sigma_DDF: jnp.ndarray
     angle_top: jnp.ndarray
 
 
 def ddf_discretization(DDF_cut, nbins=300, DDF_start=0.):
     """
-    Computes dicretization parameters for initialization of ADF compute function.
+    Computes dicretization parameters for initialization of DDF compute function.
 
     Args:
-        ADF_cut: Cut-off angle for a bending potential
+        DDF_cut: Cut-off angle for a bending potential
         nbins: Number of bins in angles
-        ADF_start: Minimal angle for a bending potential is considered
+        DDF_start: Minimal angle for a bending potential is considered
 
     Returns:
         Arrays containing bin centers in theta direction and the standard
@@ -387,13 +387,13 @@ def ddf_discretization(DDF_cut, nbins=300, DDF_start=0.):
     dtheta_bin = (DDF_cut - DDF_start) / float(nbins)
     ddf_bin_centers = jnp.linspace(DDF_start + dtheta_bin / 2., DDF_cut - dtheta_bin / 2., nbins)
     ddf_bin_boundaries = jnp.linspace(DDF_start, DDF_cut, nbins + 1)
-    sigma_ADF = jnp.array(dtheta_bin)
-    return ddf_bin_centers, ddf_bin_boundaries, sigma_ADF
+    sigma_DDF = jnp.array(dtheta_bin)
+    return ddf_bin_centers, ddf_bin_boundaries, sigma_DDF
 
 
 def initialize_dihedral_distribution_fun(ddf_params):
     """
-    Initializes a function that computes the angular distribution function (ADF) for a single state.
+    Initializes a function that computes the angular distribution function (DDF) for a single state.
 
     Angles are smoothed in radial direction via a Gaussian kernel (compare RDF function). In radial
     direction, triplets are weighted according to a Gaussian cumulative distribution function, such that
@@ -407,7 +407,7 @@ def initialize_dihedral_distribution_fun(ddf_params):
 
     Args:
         displacement_fn: Displacement functions
-        adf_params: ADFParams defining the hyperparameters of the RDF
+        ddf_params: DDFParams defining the hyperparameters of the RDF
         smoothing_dr: Standard deviation of Gaussian smoothing in radial direction
         R_init: Initial position to estimate maximum number of triplets
         nbrs_init: Initial neighborlist to estimate maximum number of triplets
@@ -416,8 +416,8 @@ def initialize_dihedral_distribution_fun(ddf_params):
     Returns:
         A function that takes a simulation state with neighborlist and returns the instantaneous adf
     """
-    _, adf_bin_centers, adf_bin_boundaries, sigma_theta, angle_top = dataclasses.astuple(ddf_params)
-    bin_size = jnp.diff(adf_bin_boundaries)
+    _, ddf_bin_centers, ddf_bin_boundaries, sigma_theta, angle_top = dataclasses.astuple(ddf_params)
+    bin_size = jnp.diff(ddf_bin_boundaries)
 
     def dihedral_corr_fun(system):
         """Compute adf contribution of each triplet."""
@@ -429,10 +429,10 @@ def initialize_dihedral_distribution_fun(ddf_params):
 
         dihedrals = vectorized_dihedral_fn(R_ab, R_bc, R_cd)
         
-        exponent = jnp.exp(-0.5 * (dihedrals[:, jnp.newaxis] - adf_bin_centers) ** 2 / sigma_theta ** 2)
+        exponent = jnp.exp(-0.5 * (dihedrals[:, jnp.newaxis] - ddf_bin_centers) ** 2 / sigma_theta ** 2)
         gaussians = exponent * bin_size / jnp.sqrt(2 * jnp.pi * sigma_theta ** 2)
-        unnormed_adf = high_precision_sum(gaussians, axis=0)
-        ddf = unnormed_adf / jnp.trapz(unnormed_adf, adf_bin_centers)
+        unnormed_ddf = high_precision_sum(gaussians, axis=0)
+        ddf = unnormed_ddf / jnp.trapz(unnormed_ddf, ddf_bin_centers)
         return ddf
 
     def ddf_fn(system, **unused_kwargs):

@@ -1,6 +1,10 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 WuResearchGroup
+
+
 from collections import namedtuple
 import jax.numpy as jnp
-from jax.tree_util import ravel_pytree
+from jax.flatten_util import ravel_pytree
 
 coweighting_stats = namedtuple("coweighting_stats", 
                                 ("current_iter", "num_losses", "mean_decay", "running_mean_L", "running_mean_l", "running_std_l", "running_S_l", "alphas"))

@@ -1,5 +1,6 @@
 import os
 
+from sympy import false
 # Configure GPU settings
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # Use GPU 0
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'  # Disable memory preallocation
@@ -34,7 +35,7 @@ from diffcg.observable.structure import (
 )
 from diffcg.io.ase_trj import read_ase_trj
 import warnings
-from diffcg.learning.diffsim import init_independent_mse_loss_fn, init_multistate_diffsim, optimize_multistate_diffsim
+from diffcg.learning.diffsim import init_diffsim, optimize_diffsim, init_independent_mse_loss_fn
 import optax
 from diffcg.io.lammps import read_lammps_data
 from ase import Atoms
@@ -50,6 +51,8 @@ configure_logging(level="DEBUG")
 # Or suppress specific warning messages
 warnings.filterwarnings("ignore", message="specific warning text")
 import os
+
+Temperature = 600
 
 
 DATASET_ROOT = "/home/zhenghaowu/development/diffCG/examples/test_gradCG_polystyrene/datasets"
@@ -140,13 +143,7 @@ def get_target_dict(temp):
     return target_dict, bond_top, angle_top, dihedral_top
 
 
-# Get target dictionaries for different temperatures
-temperatures = [500, 600]
-target_dicts = {}
-for temp in temperatures:
-    target_dicts[temp], bond_top, angle_top, dihedral_top = get_target_dict(temp)
-
-
+target_dict, bond_top, angle_top, dihedral_top = get_target_dict(Temperature)
 
 r_cut = 2.0
 r_onset = 1.5
@@ -198,94 +195,70 @@ def build_energy_fn_with_params(params, max_num_atoms=1):
 
 pretrained_params = np.load('pretrained_params.npy', allow_pickle=True).item()
 
-def create_quantity_dict(target_dict):
-    """Create quantity dictionary for a given target dictionary."""
-    quantity_dict = {}
-    if 'rdf' in target_dict:
-        rdf_struct = target_dict['rdf']
-        rdf_fn = initialize_inter_radial_distribution_fun(rdf_struct)
-        rdf_dict = {'compute_fn': rdf_fn, 'target': rdf_struct.reference_rdf, 'gamma': 1.0}
-        quantity_dict['rdf'] = rdf_dict
+quantity_dict = {}
+if 'rdf' in target_dict:
+    rdf_struct = target_dict['rdf']
+    rdf_fn = initialize_inter_radial_distribution_fun(rdf_struct)
+    rdf_dict = {'compute_fn': rdf_fn, 'target': rdf_struct.reference_rdf, 'gamma': 1.0}
+    quantity_dict['rdf'] = rdf_dict
 
-    if 'bdf' in target_dict:
-        bdf_struct = target_dict['bdf']
-        bdf_fn = initialize_bond_distribution_fun(bdf_struct)
-        bdf_dict = {'compute_fn': bdf_fn, 'target': bdf_struct.reference_bdf, 'gamma': 1.0 / 1000}
-        quantity_dict['bdf'] = bdf_dict
+if 'bdf' in target_dict:
+    bdf_struct = target_dict['bdf']
+    bdf_fn = initialize_bond_distribution_fun(bdf_struct)
+    bdf_dict = {'compute_fn': bdf_fn, 'target': bdf_struct.reference_bdf, 'gamma': 1.0 / 1000}
+    quantity_dict['bdf'] = bdf_dict
 
-    if 'adf' in target_dict:
-        adf_struct = target_dict['adf']
-        adf_fn = initialize_angle_distribution_fun(adf_struct)
-        adf_dict = {'compute_fn': adf_fn, 'target': adf_struct.reference_adf, 'gamma': 1.0 / 10}
-        quantity_dict['adf'] = adf_dict
+if 'adf' in target_dict:
+    adf_struct = target_dict['adf']
+    adf_fn = initialize_angle_distribution_fun(adf_struct)
+    adf_dict = {'compute_fn': adf_fn, 'target': adf_struct.reference_adf, 'gamma': 1.0 / 10}
+    quantity_dict['adf'] = adf_dict
 
-    if 'ddf' in target_dict:
-        ddf_struct = target_dict['ddf']
-        ddf_fn = initialize_dihedral_distribution_fun(ddf_struct)
-        ddf_dict = {'compute_fn': ddf_fn, 'target': ddf_struct.reference_ddf, 'gamma': 1.0}
-        quantity_dict['ddf'] = ddf_dict
-    
-    return quantity_dict
-
-# Create quantity dictionaries for each temperature
-quantity_dicts = {}
-for temp in temperatures:
-    quantity_dicts[temp] = create_quantity_dict(target_dicts[temp])
+if 'ddf' in target_dict:
+    ddf_struct = target_dict['ddf']
+    ddf_fn = initialize_dihedral_distribution_fun(ddf_struct)
+    ddf_dict = {'compute_fn': ddf_fn, 'target': ddf_struct.reference_ddf, 'gamma': 1.0}
+    quantity_dict['ddf'] = ddf_dict
 
 
-def create_calculate_observables_fn(quantity_dict, init_atoms):
-    """Create a calculate_observables function for a specific quantity_dict."""
-    def calculate_observables(traj_file='sample.traj'):
-        systems = read_ase_trj(traj_file)
-        batched_systems = tree_map(lambda *xs: jnp.stack(xs), *systems)  # R: (B,500,3), Z: (B,500), cell: (B,3,3)
-        
-        observables = {}
-        if 'rdf' in quantity_dict:
-            rdf_analyzer = analyze(quantity_dict['rdf']['compute_fn'], init_atoms)
-            observables['rdf'] = rdf_analyzer.analyze(batched_systems)
-        
-        if 'bdf' in quantity_dict:
-            bdf_analyzer = analyze(quantity_dict['bdf']['compute_fn'], init_atoms)
-            observables['bdf'] = bdf_analyzer.analyze(batched_systems)
-        
-        if 'adf' in quantity_dict:
-            adf_analyzer = analyze(quantity_dict['adf']['compute_fn'], init_atoms)
-            observables['adf'] = adf_analyzer.analyze(batched_systems)
-        
-        if 'ddf' in quantity_dict:
-            ddf_analyzer = analyze(quantity_dict['ddf']['compute_fn'], init_atoms)
-            observables['ddf'] = ddf_analyzer.analyze(batched_systems)
+def calculate_observables(traj_file='sample.traj'):
+    systems = read_ase_trj(traj_file)
+    batched_systems = tree_map(lambda *xs: jnp.stack(xs), *systems)  # R: (B,500,3), Z: (B,500), cell: (B,3,3)
+    rdf_analyzer = analyze(quantity_dict['rdf']['compute_fn'], init_atoms)
+    bdf_analyzer = analyze(quantity_dict['bdf']['compute_fn'], init_atoms)
+    adf_analyzer = analyze(quantity_dict['adf']['compute_fn'], init_atoms)
+    ddf_analyzer = analyze(quantity_dict['ddf']['compute_fn'], init_atoms)
 
-        return observables
-    return calculate_observables
+    rdfs = rdf_analyzer.analyze(batched_systems)
+    bdfs = bdf_analyzer.analyze(batched_systems)
+    adfs = adf_analyzer.analyze(batched_systems)
+    ddfs = ddf_analyzer.analyze(batched_systems)
+
+    observables = {'rdf': rdfs, 'bdf': bdfs, 'adf': adfs, 'ddf': ddfs}
+    return observables
 
 
-# Load initial structure
-lammpsdata_file = {
-    'T600': '/home/zhenghaowu/development/diffCG/examples/test_gradCG_polystyrene/datasets/T600/PS.data',
-    'T500': '/home/zhenghaowu/development/diffCG/examples/test_gradCG_polystyrene/datasets/T500/PS.data',
-    'T400': '/home/zhenghaowu/development/diffCG/examples/test_gradCG_polystyrene/datasets/T400/PS.data',
-    'T300': '/home/zhenghaowu/development/diffCG/examples/test_gradCG_polystyrene/datasets/T300/PS.data',
-}
+loss_fn = init_independent_mse_loss_fn(quantity_dict)
 
-init_atoms = {} 
-for temp in temperatures:
-    sys_data = read_lammps_data(lammpsdata_file[f'T{temp}'])
-    # Mapping of atom types
-    atom_types_mapping = {0: 'C', 1: 'C', 2: 'H'}
-    data_element_figurelist = sys_data["atom_types"]
-    data_element = [atom_types_mapping[i] for i in data_element_figurelist]
+lammpsdata_file = (
+    '/home/zhenghaowu/development/diffCG/examples/test_gradCG_polystyrene/datasets/T600/PS.data'
+)
+sys_data = read_lammps_data(lammpsdata_file)
+# Mapping of atom types
+atom_types_mapping = {0: 'C', 1: 'C', 2: 'H'}
+data_element_figurelist = sys_data["atom_types"]
+data_element = [atom_types_mapping[i] for i in data_element_figurelist]
 
-    # Extract coordinates and cell information
-    data_coord = sys_data["coords"] / 10.0  # A to nm
-    cell = sys_data["cells"][0] / 10.0  # A to nm
+# Extract coordinates and cell information
+data_coord = sys_data["coords"] / 10.0  # A to nm
+cell = sys_data["cells"][0] / 10.0  # A to nm
 
-    data_coord = data_coord[0]
+data_coord = data_coord[0]
 
-    # Create ASE Atoms object
-    init_atoms[temp] = Atoms(positions=data_coord, symbols=data_element, cell=cell, pbc=jnp.array([True, True, True]))
-    _masses = [104.0 for i in range(500)]
-    init_atoms[temp].set_masses(_masses)
+# Create ASE Atoms object
+init_atoms = Atoms(positions=data_coord, symbols=data_element, cell=cell, pbc=jnp.array([True, True, True]))
+_masses = [104.0 for i in range(500)]
+init_atoms.set_masses(_masses)
 
 initial_lr = 0.1
 lr_schedule = optax.exponential_decay(-initial_lr, 200, 0.005)
@@ -295,64 +268,39 @@ optimizer = optax.chain(
 )
 
 sim_time_scheme = {'production_steps': 6 * 1000, 'equilibration_steps': 1000}
+sampler_params = {
+    'ensemble': "nvt",
+    'thermostat': "berendsen",
+    'temperature': Temperature,
+    'starting_temperature': Temperature,
+    'timestep': 4,
+    'trajectory': "sample",
+    'logfile': "sample",
+    'loginterval': 12,
+}
 
 params = pretrained_params
 
-# Create multistate configuration
-states = {}
-state_weights = {}
+# Build the functional single-state update function and run one iteration
+state = {
+    'init_atoms': init_atoms,
+    'r_cut': r_cut,
+    'quantity_dict': quantity_dict,
+    'calculate_observables_fn': calculate_observables,
+    'sampler_params': sampler_params,
+    'sim_time_scheme': sim_time_scheme,
+}
 
-for temp in temperatures:
-    state_id = f"T{temp}"
-    
-    # Create unique trajectory and log file names for each state
-    sampler_params = {
-        'ensemble': "nvt",
-        'thermostat': "berendsen",
-        'temperature': temp,
-        'starting_temperature': temp,
-        'timestep': 4,
-        'trajectory': f"sample_T{temp}_",  # Unique trajectory prefix
-        'logfile': f"sample_T{temp}_",     # Unique log prefix
-        'loginterval': 12,
-    }
-    
-    # Create calculate_observables function for this temperature
-    calculate_observables_fn = create_calculate_observables_fn(quantity_dicts[temp], init_atoms[temp])
-    
-    states[state_id] = {
-        'init_atoms': init_atoms[temp],
-        'r_cut': r_cut,
-        'quantity_dict': quantity_dicts[temp],
-        'calculate_observables_fn': calculate_observables_fn,
-        'sampler_params': sampler_params,
-        'sim_time_scheme': sim_time_scheme,
-    }
-    
-    # Equal weights for all states
-    state_weights[state_id] = 1.0
-
-# Initialize multistate DiffSim with coweighting
-update_fn = init_multistate_diffsim(
+update_fn = init_diffsim(
     reweight_ratio=0.9,
-    states=states,
+    state=state,
     build_energy_fn_with_params_fn=build_energy_fn_with_params,
     optimizer=optimizer,
     Boltzmann_constant=Boltzmann_constant,
-    state_weights=state_weights,
-    multiobj='coweighting'  # Use coweighting algorithm
 )
 
-# Run multistate optimization
-loss_history, times_per_update, predictions_history, params_set, per_state_loss_history = optimize_multistate_diffsim(
+loss_history, times_per_update, predictions_history, params_set = optimize_diffsim(
     update_fn, params, total_iterations=1
 )
-
-# Print results for each state
-print("Final per-state losses:")
-for state_id, loss in per_state_loss_history[-1].items():
-    print(f"  {state_id}: {loss}")
-
-print(f"Total loss: {loss_history[-1]}")
 
 

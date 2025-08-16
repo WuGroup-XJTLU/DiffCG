@@ -395,7 +395,7 @@ def init_multistate_diffsim(
                 loss_val, predictions = ctx['loss_fn'](observables_by_state[sid], weights)
                 predictions_by_state[sid] = predictions
                 per_state_losses[sid] = loss_val
-                #total += state_weights.get(sid, 1.0) * loss_val
+                
             if multiobj == 'coweighting':
                 # Apply coweighting algorithm
                 total_loss, updated_stats = coweighting_fn(per_state_losses, coweighting_stats)
