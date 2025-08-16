@@ -143,10 +143,10 @@ See `test_learning.py` for a full example of:
 Contributions are welcome. Please open issues/PRs with minimal reproducible examples when reporting bugs or proposing features.
 
 ### Reference
-[Learning pair potentials using differentiable simulations](https://pubs.aip.org/aip/jcp/article/158/4/044113/2876571)
-[Structural Coarse-Graining via Multiobjective Optimization with Differentiable Simulation](https://pubs.acs.org/doi/10.1021/acs.jctc.3c01348)
-[Learning neural network potentials from experimental data via Differentiable Trajectory Reweighting](https://www.nature.com/articles/s41467-021-27241-4)
-[Differentiable molecular simulation can learn all the parameters in a coarse-grained force field for proteins](https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0256990)
+- [Learning pair potentials using differentiable simulations](https://pubs.aip.org/aip/jcp/article/158/4/044113/2876571)
+- [Structural Coarse-Graining via Multiobjective Optimization with Differentiable Simulation](https://pubs.acs.org/doi/10.1021/acs.jctc.3c01348)
+- [Learning neural network potentials from experimental data via Differentiable Trajectory Reweighting](https://www.nature.com/articles/s41467-021-27241-4)
+- [Differentiable molecular simulation can learn all the parameters in a coarse-grained force field for proteins](https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0256990)
 
 ### Acknowlodge
 Difftre: https://github.com/tummfm/difftre
