@@ -234,7 +234,7 @@ def init_multistate_diffsim(
 
     rerun_energy_by_state = {sid: build_rerun_energy_fn_for_state(sid) for sid in state_ids}
 
-    def create_md_for_state(state_id, step, sample_energy_fn):
+    def create_md_for_state_equ(state_id, step, init_atoms, sample_energy_fn):
         """Create and return MD object(s) for the given state and step.
 
         Returns either a tuple (md_equ, md_prod) for two-phase runs or a single md for one-phase.
@@ -242,25 +242,41 @@ def init_multistate_diffsim(
         state = states[state_id]
         sampler_params = state['sampler_params']
         r_cut = state.get('r_cut', 1.0)
-        init_atoms = state['init_atoms']
+        #init_atoms = state['init_atoms']
 
         calculator = CustomCalculator(sample_energy_fn, cutoff=r_cut)
 
         scheme = state['sim_time_scheme']
-        if 'equilibration_steps' in scheme and 'production_steps' in scheme:
-            md_equ = MolecularDynamics(
-                init_atoms,
-                custom_calculator=calculator,
-                ensemble=sampler_params['ensemble'],
-                thermostat=sampler_params['thermostat'],
-                temperature=sampler_params['temperature'],
-                starting_temperature=sampler_params['starting_temperature'],
-                timestep=sampler_params['timestep'],
-                trajectory=None,
-                logfile=None,
-                loginterval=None,
-            )
-            md_prod = MolecularDynamics(
+        
+        md_equ = MolecularDynamics(
+            init_atoms,
+            custom_calculator=calculator,
+            ensemble=sampler_params['ensemble'],
+            thermostat=sampler_params['thermostat'],
+            temperature=sampler_params['temperature'],
+            starting_temperature=sampler_params['starting_temperature'],
+            timestep=sampler_params['timestep'],
+            trajectory=None,
+            logfile=None,
+            loginterval=None,
+        )
+        return md_equ
+
+    def create_md_for_state_prd(state_id, step, init_atoms, sample_energy_fn):
+        """Create and return MD object(s) for the given state and step.
+
+        Returns either a tuple (md_equ, md_prod) for two-phase runs or a single md for one-phase.
+        """
+        state = states[state_id]
+        sampler_params = state['sampler_params']
+        r_cut = state.get('r_cut', 1.0)
+        #init_atoms = state['init_atoms']
+
+        calculator = CustomCalculator(sample_energy_fn, cutoff=r_cut)
+
+        scheme = state['sim_time_scheme']
+        
+        md_prod = MolecularDynamics(
                 init_atoms,
                 custom_calculator=calculator,
                 ensemble=sampler_params['ensemble'],
@@ -272,21 +288,7 @@ def init_multistate_diffsim(
                 logfile=f"{sampler_params['logfile']}{step}.log",
                 loginterval=sampler_params['loginterval'],
             )
-            return md_equ, md_prod
-        else:
-            md = MolecularDynamics(
-                init_atoms,
-                custom_calculator=calculator,
-                ensemble=sampler_params['ensemble'],
-                thermostat=sampler_params['thermostat'],
-                temperature=sampler_params['temperature'],
-                starting_temperature=sampler_params['starting_temperature'],
-                timestep=sampler_params['timestep'],
-                trajectory=f"{sampler_params['trajectory']}{step}.traj",
-                logfile=f"{sampler_params['logfile']}{step}.log",
-                loginterval=sampler_params['loginterval'],
-            )
-            return md
+        return md_prod
 
     def update_fn(step, params, old_params, opt_state):
         if opt_state is None:
@@ -305,15 +307,10 @@ def init_multistate_diffsim(
 
             # Prepare trajectories
             if step == 0:
-                md_objs = create_md_for_state(sid, step, sample_energy_fn)
-                if isinstance(md_objs, tuple):
-                    md_equ, md_prod = md_objs
-                    md_equ.run(scheme['equilibration_steps'])
-                    md_prod.set_atoms(md_equ.atoms)
-                    md_prod.run(scheme['production_steps'])
-                else:
-                    md = md_objs
-                    md.run(scheme['total_simulation_steps'])
+                md_equ = create_md_for_state_equ(sid,step, state['init_atoms'], sample_energy_fn)
+                md_equ.run(scheme['equilibration_steps'])
+                md_prod = create_md_for_state_prd(sid,step, md_equ.atoms, sample_energy_fn)
+                md_prod.run(scheme['production_steps'])
                 trajs = read(f"{sampler_params['trajectory']}{step}.traj", index=':')
             else:
                 logger.info(f"[state={sid}] Reusing trajectory {step-1}")
@@ -341,17 +338,10 @@ def init_multistate_diffsim(
                 )
                 new_atoms = trajs[-1]
                 os.system(f"rm {sampler_params['logfile']}{step}.log")
-                md_objs = create_md_for_state(sid, step, sample_energy_fn)
-                if isinstance(md_objs, tuple):
-                    md_equ, md_prod = md_objs
-                    md_equ.set_atoms(new_atoms)
-                    md_equ.run(scheme['equilibration_steps'])
-                    md_prod.set_atoms(md_equ.atoms)
-                    md_prod.run(scheme['production_steps'])
-                else:
-                    md = md_objs
-                    md.set_atoms(new_atoms)
-                    md.run(scheme['total_simulation_steps'])
+                md_equ = create_md_for_state_equ(sid, step, new_atoms, sample_energy_fn)
+                md_equ.run(scheme['equilibration_steps'])
+                md_prod = create_md_for_state_prd(sid, step, md_equ.atoms, sample_energy_fn)
+                md_prod.run(scheme['production_steps'])
                 trajs = read(f"{sampler_params['trajectory']}{step}.traj", index=':')
                 # recompute ref energies and estimator
                 ref_energies = rerun_energy_by_state[sid](old_params, trajs)
@@ -490,26 +480,34 @@ def init_diffsim(
     loss_fn = init_independent_mse_loss_fn(state['quantity_dict'])
     max_num_atoms = state['init_atoms'].get_global_number_of_atoms()
 
-    def create_md(step, sample_energy_fn):
+    def create_md_equ(step, init_atoms, sample_energy_fn):
         sampler_params = state['sampler_params']
         r_cut = state.get('r_cut', 1.0)
-        init_atoms = state['init_atoms']
+        #init_atoms = state['init_atoms']
         calculator = CustomCalculator(sample_energy_fn, cutoff=r_cut)
         scheme = state['sim_time_scheme']
-        if 'equilibration_steps' in scheme and 'production_steps' in scheme:
-            md_equ = MolecularDynamics(
-                init_atoms,
-                custom_calculator=calculator,
-                ensemble=sampler_params['ensemble'],
-                thermostat=sampler_params['thermostat'],
-                temperature=sampler_params['temperature'],
-                starting_temperature=sampler_params['starting_temperature'],
-                timestep=sampler_params['timestep'],
-                trajectory=None,
-                logfile=None,
-                loginterval=None,
-            )
-            md_prod = MolecularDynamics(
+        
+        md_equ = MolecularDynamics(
+            init_atoms,
+            custom_calculator=calculator,
+            ensemble=sampler_params['ensemble'],
+            thermostat=sampler_params['thermostat'],
+            temperature=sampler_params['temperature'],
+            starting_temperature=sampler_params['starting_temperature'],
+            timestep=sampler_params['timestep'],
+            trajectory=None,
+            logfile=None,
+            loginterval=None,
+        )
+        return md_equ
+
+    def create_md_prd(step, init_atoms, sample_energy_fn):
+        sampler_params = state['sampler_params']
+        r_cut = state.get('r_cut', 1.0)
+        #init_atoms = state['init_atoms']
+        calculator = CustomCalculator(sample_energy_fn, cutoff=r_cut)
+        
+        md_prod = MolecularDynamics(
                 init_atoms,
                 custom_calculator=calculator,
                 ensemble=sampler_params['ensemble'],
@@ -521,21 +519,7 @@ def init_diffsim(
                 logfile=f"{sampler_params['logfile']}{step}.log",
                 loginterval=sampler_params['loginterval'],
             )
-            return md_equ, md_prod
-        else:
-            md = MolecularDynamics(
-                init_atoms,
-                custom_calculator=calculator,
-                ensemble=sampler_params['ensemble'],
-                thermostat=sampler_params['thermostat'],
-                temperature=sampler_params['temperature'],
-                starting_temperature=sampler_params['starting_temperature'],
-                timestep=sampler_params['timestep'] ,
-                trajectory=f"{sampler_params['trajectory']}{step}.traj",
-                logfile=f"{sampler_params['logfile']}{step}.log",
-                loginterval=sampler_params['loginterval'],
-            )
-            return md
+        return md_prod
 
     def rerun_energy(params, traj):
         results = []
@@ -557,15 +541,10 @@ def init_diffsim(
 
         # Prepare trajectories: run or reuse
         if step == 0:
-            md_objs = create_md(step, sample_energy_fn)
-            if isinstance(md_objs, tuple):
-                md_equ, md_prod = md_objs
-                md_equ.run(scheme['equilibration_steps'])
-                md_prod.set_atoms(md_equ.atoms)
-                md_prod.run(scheme['production_steps'])
-            else:
-                md = md_objs
-                md.run(scheme['total_simulation_steps'])
+            md_equ = create_md_equ(step, state['init_atoms'], sample_energy_fn)
+            md_equ.run(scheme['equilibration_steps'])
+            md_prod = create_md_prd(step, md_equ.atoms, sample_energy_fn)
+            md_prod.run(scheme['production_steps'])
             trajs = read(f"{sampler_params['trajectory']}{step}.traj", index=':')
         else:
             logger.info(f"Reusing trajectory {step-1}")
@@ -593,32 +572,27 @@ def init_diffsim(
             )
             new_atoms = trajs[-1]
             os.system(f"rm {sampler_params['logfile']}{step}.log")
-            md_objs = create_md(step, sample_energy_fn)
-            if isinstance(md_objs, tuple):
-                md_equ, md_prod = md_objs
-                md_equ.set_atoms(new_atoms)
-                md_equ.run(scheme['equilibration_steps'])
-                md_prod.set_atoms(md_equ.atoms)
-                md_prod.run(scheme['production_steps'])
-            else:
-                md = md_objs
-                md.set_atoms(new_atoms)
-                md.run(scheme['total_simulation_steps'])
-            trajs = read(f"{sampler_params['trajectory']}{step}.traj", index=':')
+            os.system(f"rm {sampler_params['trajectory']}{step}.traj")
+            md_equ = create_md_equ(step, new_atoms, sample_energy_fn)
+            md_equ.run(scheme['equilibration_steps'])
+            md_prod = create_md_prd(step, md_equ.atoms, sample_energy_fn)
+            md_prod.run(scheme['production_steps'])
+            _trajs = read(f"{sampler_params['trajectory']}{step}.traj", index=':')
             # recompute ref energies and estimator
-            ref_energies = rerun_energy(old_params, trajs)
+            ref_energies = rerun_energy(old_params, _trajs)
             estimator = ReweightEstimator(
                 ref_energies,
                 kBT=sampler_params['temperature'] * Boltzmann_constant,
                 base_energies=None,
                 volume=None,
             )
+            trajs = _trajs
 
         # Compute observables once per step
         observables = state['calculate_observables_fn'](
             f"{sampler_params['trajectory']}{step}.traj"
         )
-
+        
         def wrapped_loss(p):
             energies = rerun_energy(p, trajs)
             weights, _ = estimator.estimate_weight(energies)
@@ -663,5 +637,4 @@ def optimize_diffsim(update_fn, params, total_iterations):
         times_per_update.append(step_time)
         predictions_history.append(predictions)
         params_set.append(params)
-
     return loss_history, times_per_update, predictions_history, params_set

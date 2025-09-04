@@ -183,6 +183,8 @@ class MolecularDynamics:
 
         self.atoms.calc = custom_calculator
 
+        self.calculator = custom_calculator
+
         timestep = timestep * 0.1 # the length scale is in nm, the time unit is \AA \sqrt(u/eV), where AA is angstrom, u is atomic mass, and eV is energy unit
 
         if taut is None:
@@ -392,7 +394,7 @@ class MolecularDynamics:
         Args:
             atoms (Atoms): new atoms for running MD
         """
-        calculator = self.atoms.calc
+        #calculator = self.atoms.calc
         self.atoms = atoms
         self.dyn.atoms = atoms
-        self.dyn.atoms.calc = calculator
+        self.dyn.atoms.calc = self.calculator

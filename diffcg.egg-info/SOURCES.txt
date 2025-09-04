@@ -19,6 +19,7 @@ diffcg/io/convert.py
 diffcg/io/lammps.py
 diffcg/learning/diffsim.py
 diffcg/learning/ibi.py
+diffcg/learning/multiobj.py
 diffcg/learning/relative_entropy.py
 diffcg/learning/reweighting.py
 diffcg/md/__init__.py
@@ -29,7 +30,6 @@ diffcg/observable/structure.py
 diffcg/observable/thermo.py
 diffcg/util/boltzmann_inversion.py
 diffcg/util/custom_interpolate.py
-diffcg/util/custom_quantity.py
 diffcg/util/logger.py
 diffcg/util/math.py
 diffcg/util/util.py

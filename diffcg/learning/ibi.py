@@ -159,8 +159,8 @@ class IterativeBoltzmannInversion:
             self.U_angle = jnp.array(U0)
 
         if self.targets.ddf is not None:
-            tgt = self.targets.ddf.reference_adf
-            centers = self.targets.ddf.adf_bin_centers
+            tgt = self.targets.ddf.reference_ddf
+            centers = self.targets.ddf.ddf_bin_centers
             U0 = boltzmann_inversion(self.kBT, np.clip(np.asarray(tgt), EPS, None))
             U0 = U0 - U0[0]
             self.x_dihedral = jnp.array(centers)
@@ -327,7 +327,7 @@ class IterativeBoltzmannInversion:
 
         if self.targets.ddf is not None:
             ddf_fn = initialize_dihedral_distribution_fun(self.targets.ddf)
-            quantity["ddf"] = {"compute_fn": ddf_fn, "target": self.targets.ddf.reference_adf}
+            quantity["ddf"] = {"compute_fn": ddf_fn, "target": self.targets.ddf.reference_ddf}
 
         return quantity
 
@@ -429,7 +429,7 @@ class IterativeBoltzmannInversion:
         # Dihedral
         if self.U_dihedral is not None and "ddf" in observables:
             P_sim = observables["ddf"]
-            P_tgt = jnp.array(self.targets.ddf.reference_adf)
+            P_tgt = jnp.array(self.targets.ddf.reference_ddf)
             self.U_dihedral = self._update_table(
                 self.U_dihedral,
                 P_sim,

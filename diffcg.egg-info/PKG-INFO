@@ -1,10 +1,10 @@
-Metadata-Version: 2.4
+Metadata-Version: 2.1
 Name: diffcg
 Version: 0.1.0
 Summary: A JAX-based modular package for differentiable coarse-graining
 Author-email: Zhenghao Wu <zhenghao.wu@xjtlu.edu.cn>
 Maintainer-email: WuResearchGroup <zhenghao.wu@xjtlu.edu.cn>
-License-Expression: MIT
+License: MIT
 Project-URL: Homepage, https://github.com/your-org/diffCG
 Project-URL: Issues, https://github.com/your-org/diffCG/issues
 Project-URL: Documentation, https://your-org.github.io/diffCG/
@@ -23,8 +23,6 @@ Requires-Dist: pandas>=1.5
 Requires-Dist: ase>=3.22
 Requires-Dist: chemfiles>=0.10
 Requires-Dist: optax>=0.1.6
-Requires-Dist: jax>=0.4.14
-Requires-Dist: jaxlib>=0.4.14
 Provides-Extra: examples
 Requires-Dist: matplotlib>=3.6; extra == "examples"
 Requires-Dist: dpdata>=0.2; extra == "examples"
@@ -40,7 +38,6 @@ Requires-Dist: mypy>=1.7; extra == "dev"
 Provides-Extra: docs
 Requires-Dist: mkdocs-material; extra == "docs"
 Requires-Dist: mkdocstrings[python]; extra == "docs"
-Dynamic: license-file
 
 ## DiffCG: a JAX-based modular package for differentiable coarse-graining
 
@@ -131,7 +128,8 @@ exclude_mask = jnp.ones((num_atoms, num_atoms))
 inter_params = InterRDFParams(None, centers, boundaries, sigma, exclude_mask)
 rdf_fn = initialize_inter_radial_distribution_fun(inter_params)
 
-rdf_analyzer = analyze(rdf_fn)
+# Note: analyze class now requires init_atoms parameter
+rdf_analyzer = analyze(rdf_fn, atoms)
 rdf_series = rdf_analyzer.analyze(batched)  # shape: (n_frames, nbins)
 ```
 
@@ -144,49 +142,95 @@ data = read_lammps_data("PS.data")
 traj = read_lammps_dump("dump.lammpstrj")
 ```
 
-#### 4) Example top-down learning with reweighting
+#### 4) Example learning workflows
 
-See `test_learning.py` for a full example of:
+See the `example/` directory for complete examples:
 
-- assembling tabulated and harmonic terms into a total energy,
-- running short MD to generate trajectories,
-- computing observables (RDF/BDF/ADF/DDF), and
-- optimizing spline parameters via a reweighting estimator.
+- `test_diffsim.py`: Differentiable simulation with single-objective optimization
+- `test_diffsim_multiobj.py`: Multi-objective optimization with co-weighting
+- `examples/test_gradCG_polystyrene/`: Comprehensive polystyrene coarse-graining workflow
 
+These examples demonstrate:
+- Assembling tabulated and harmonic terms into a total energy
+- Running MD simulations to generate trajectories
+- Computing observables (RDF/BDF/ADF/DDF)
+- Optimizing parameters via differentiable simulation and reweighting
+
+
+### Core concepts
+
+- **System representation**: The package uses a `System` dataclass to represent molecular configurations with positions (`R`), atomic numbers (`Z`), and simulation cell information.
+- **JAX integration**: All computations leverage JAX for automatic differentiation, JIT compilation, and vectorization.
+- **Modular design**: Energy terms, observables, and learning algorithms are designed as composable building blocks.
+- **ASE compatibility**: Seamless integration with the Atomic Simulation Environment (ASE) for structure manipulation and I/O.
 
 ### Main API surface
 
-- Energies (`diffcg/energy.py`)
-  - Tabulated pair/bond/angle/dihedral: `TabulatedPairEnergy`, `TabulatedBondEnergy`, `TabulatedAngleEnergy`, `TabulatedDihedralEnergy`
+- **Energies** (`diffcg/energy.py`)
+  - Tabulated potentials: `TabulatedPairEnergy`, `TabulatedBondEnergy`, `TabulatedAngleEnergy`, `TabulatedDihedralEnergy`
   - Harmonic terms: `HarmonicBondEnergy`, `HarmonicAngleEnergy`, `HarmonicDihedralEnergy`
-  - Utilities: `tabulated`, `generic_repulsion`, `multiplicative_isotropic_cutoff`
+  - Generic repulsion: `GenericRepulsionEnergy`
+  - Utilities: `tabulated`, `multiplicative_isotropic_cutoff`
 
-- MD and ASE integration (`diffcg/md/`)
+- **MD and ASE integration** (`diffcg/md/`)
   - Calculators: `CustomCalculator`, `CustomEnergyCalculator`
   - MD wrapper: `MolecularDynamics`
+  - Trajectory observer: `TrajectoryObserver`
 
-- Observables (`diffcg/observable/`)
+- **Learning methods** (`diffcg/learning/`)
+  - IBI: `IterativeBoltzmannInversion`, `IBIConfig`, `IBITargets`
+  - DiffSim: `init_diffsim`, `optimize_diffsim`, `init_independent_mse_loss_fn` (class `DiffSim` deprecated)
+  - Relative entropy: `RelativeEntropy`
+  - Multi-objective: `init_coweighting_stats`, `coweightingloss_init`
+  - Reweighting: `ReweightEstimator`
+
+- **Observables** (`diffcg/observable/`)
   - RDF: `rdf_discretization`, `initialize_radial_distribution_fun`, `initialize_inter_radial_distribution_fun`, `InterRDFParams`
-  - BDF/ADF/DDF: `bdf_discretization`, `ADFParams`, `DDFParams`, `initialize_bond_distribution_fun`, `initialize_angle_distribution_fun`, `initialize_dihedral_distribution_fun`
+  - BDF/ADF/DDF: `bdf_discretization`, `adf_discretization`, `ddf_discretization`, `BDFParams`, `ADFParams`, `DDFParams`
+  - Initialization functions: `initialize_bond_distribution_fun`, `initialize_angle_distribution_fun`, `initialize_dihedral_distribution_fun`
   - Analysis helper: `analyze`
+  - Thermodynamic observables: (`diffcg/observable/thermo.py`)
 
-- I/O (`diffcg/io/`)
+- **I/O** (`diffcg/io/`)
   - LAMMPS: `read_lammps_data`, `read_lammps_dump`, `read_lammps_traj`
   - ASE: `read_ase_trj`
+  - Conversion utilities: (`diffcg/io/convert.py`)
+
+- **Common utilities** (`diffcg/common/`)
+  - Geometry: `distance`, `angle`, `dihedral`, `vectorized_angle_fn`, `vectorized_dihedral_fn`
+  - Periodic boundary conditions: `displacement`
+  - Neighbor lists: `neighbor_list`
+  - Constants and error handling
+
+- **Utilities** (`diffcg/util/`)
+  - Logging: `configure_logging`, `get_logger`
+  - Math utilities: `high_precision_sum`
+  - Boltzmann inversion: `boltzmann_inversion`
+  - Custom interpolation: `MonotonicInterpolate`
 
 
 ### Notes and tips
 
-- Units in examples commonly follow ASE conventions (e.g., positions in Å when using ASE `Atoms`), but many examples in this repo use nm and kJ/mol; ensure consistency when mixing data sources.
-- Smooth cutoffs (`multiplicative_isotropic_cutoff`) ensure continuity at the cutoff; prefer them for stable MD.
-- When building larger models, sum multiple energy terms inside a single callable and pass it to `CustomCalculator`.
+- **Units**: Examples commonly follow ASE conventions (e.g., positions in Å when using ASE `Atoms`), but many examples in this repo use nm and kJ/mol; ensure consistency when mixing data sources.
+- **Smooth cutoffs**: Use `multiplicative_isotropic_cutoff` to ensure continuity at the cutoff; prefer them for stable MD.
+- **Energy combination**: When building larger models, sum multiple energy terms inside a single callable and pass it to `CustomCalculator`.
+- **Logging**: Use `from diffcg import configure_logging; configure_logging(level="DEBUG")` for detailed output during development.
+- **Deprecated APIs**: The `DiffSim` class is deprecated; use the functional API with `init_diffsim` and `optimize_diffsim` instead.
 
 
 ### Contributing
 
 Contributions are welcome. Please open issues/PRs with minimal reproducible examples when reporting bugs or proposing features.
 
-### Acknowlodge
-Difftre: https://github.com/tummfm/difftre
-glp: https://github.com/sirmarcel/glp
+### Reference
+- [Learning pair potentials using differentiable simulations](https://pubs.aip.org/aip/jcp/article/158/4/044113/2876571)
+- [Structural Coarse-Graining via Multiobjective Optimization with Differentiable Simulation](https://pubs.acs.org/doi/10.1021/acs.jctc.3c01348)
+- [Learning neural network potentials from experimental data via Differentiable Trajectory Reweighting](https://www.nature.com/articles/s41467-021-27241-4)
+- [Differentiable molecular simulation can learn all the parameters in a coarse-grained force field for proteins](https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0256990)
+
+### Acknowledgments
+
+This package builds upon ideas and code from:
+- [difftre](https://github.com/tummfm/difftre): Differentiable trajectory reweighting
+- [glp](https://github.com/sirmarcel/glp): Gaussian linear potentials
 

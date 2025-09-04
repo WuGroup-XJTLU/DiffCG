@@ -22,7 +22,6 @@ from diffcg.observable.structure import (
     initialize_angle_distribution_fun,
     initialize_bond_distribution_fun,
     initialize_dihedral_distribution_fun,
-    initialize_radial_distribution_fun,
     InterRDFParams,
     BDFParams,
     ADFParams,
@@ -196,7 +195,7 @@ def build_energy_fn_with_params(params, max_num_atoms=1):
     return energy_fn
 
 
-pretrained_params = np.load('pretrained_params.npy', allow_pickle=True).item()
+pretrained_params = np.load('/home/zhenghaowu/development/diffCG/tests/pretrained_params.npy', allow_pickle=True).item()
 
 def create_quantity_dict(target_dict):
     """Create quantity dictionary for a given target dictionary."""

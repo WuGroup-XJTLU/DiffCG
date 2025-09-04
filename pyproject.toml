@@ -8,7 +8,7 @@ description = "A JAX-based modular package for differentiable coarse-graining"
 readme = "README.md"
 requires-python = ">=3.8"
 version = "0.1.0"
-license = "MIT"
+license = {text = "MIT"}
 authors = [{ name = "Zhenghao Wu", email = "zhenghao.wu@xjtlu.edu.cn" }]
 maintainers = [{ name = "WuResearchGroup", email = "zhenghao.wu@xjtlu.edu.cn" }]
 keywords = ["coarse-graining", "molecular dynamics", "polymers"]
@@ -26,8 +26,6 @@ dependencies = [
   "ase>=3.22",
   "chemfiles>=0.10",
   "optax>=0.1.6",
-  "jax>=0.4.14",
-  "jaxlib>=0.4.14",
 ]
 
 [project.urls]
