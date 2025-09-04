@@ -18,6 +18,7 @@ from diffcg.md.calculator import CustomCalculator, CustomEnergyCalculator, init_
 from diffcg.learning.reweighting import ReweightEstimator
 from diffcg.system import trj_atom_to_system, System
 from diffcg.common.neighborlist import neighbor_list
+from diffcg.md.sample import MolecularDynamics
 
 def _tree_sum_batch(tree, axis: int = 0):
     """Sum a batched pytree along a given axis for every leaf."""
@@ -89,55 +90,46 @@ def init_relative_entropy(
     beta = 1.0 / (temperature * Boltzmann_constant)
     max_num_atoms = state['init_atoms'].get_global_number_of_atoms()
 
-    def create_md(step, sample_energy_fn):
+    def create_md_equ(step, init_atoms, sample_energy_fn):
         sampler_params = state['sampler_params']
         r_cut = state.get('r_cut', 1.0)
-        init_atoms = state['init_atoms']
+        #init_atoms = state['init_atoms']
         calculator = CustomCalculator(sample_energy_fn, cutoff=r_cut)
         scheme = state['sim_time_scheme']
-        if 'equilibration_steps' in scheme and 'production_steps' in scheme:
-            from diffcg.md.sample import MolecularDynamics
+        
+        md_equ = MolecularDynamics(
+            init_atoms,
+            custom_calculator=calculator,
+            ensemble=sampler_params['ensemble'],
+            thermostat=sampler_params['thermostat'],
+            temperature=sampler_params['temperature'],
+            starting_temperature=sampler_params['starting_temperature'],
+            timestep=sampler_params['timestep'],
+            trajectory=None,
+            logfile=None,
+            loginterval=None,
+        )
+        return md_equ
 
-            md_equ = MolecularDynamics(
+    def create_md_prd(step, init_atoms, sample_energy_fn):
+        sampler_params = state['sampler_params']
+        r_cut = state.get('r_cut', 1.0)
+        #init_atoms = state['init_atoms']
+        calculator = CustomCalculator(sample_energy_fn, cutoff=r_cut)
+        
+        md_prod = MolecularDynamics(
                 init_atoms,
                 custom_calculator=calculator,
                 ensemble=sampler_params['ensemble'],
                 thermostat=sampler_params['thermostat'],
                 temperature=sampler_params['temperature'],
                 starting_temperature=sampler_params['starting_temperature'],
-                timestep=sampler_params['timestep'] ,
-                trajectory=None,
-                logfile=None,
-                loginterval=None,
-            )
-            md_prod = MolecularDynamics(
-                init_atoms,
-                custom_calculator=calculator,
-                ensemble=sampler_params['ensemble'],
-                thermostat=sampler_params['thermostat'],
-                temperature=sampler_params['temperature'],
-                starting_temperature=sampler_params['starting_temperature'],
-                timestep=sampler_params['timestep'] ,
+                timestep=sampler_params['timestep'],
                 trajectory=f"{sampler_params['trajectory']}{step}.traj",
                 logfile=f"{sampler_params['logfile']}{step}.log",
                 loginterval=sampler_params['loginterval'],
             )
-            return md_equ, md_prod
-        else:
-            from diffcg.md.sample import MolecularDynamics
-            md = MolecularDynamics(
-                init_atoms,
-                custom_calculator=calculator,
-                ensemble=sampler_params['ensemble'],
-                thermostat=sampler_params['thermostat'],
-                temperature=sampler_params['temperature'],
-                starting_temperature=sampler_params['starting_temperature'],
-                timestep=sampler_params['timestep'] ,
-                trajectory=f"{sampler_params['trajectory']}{step}.traj",
-                logfile=f"{sampler_params['logfile']}{step}.log",
-                loginterval=sampler_params['loginterval'],
-            )
-            return md
+        return md_prod
 
     def rerun_energy(params, traj):
         results = []
@@ -159,15 +151,10 @@ def init_relative_entropy(
 
         # Prepare CG proposal trajectories: run or reuse
         if step == 0:
-            md_objs = create_md(step, sample_energy_fn)
-            if isinstance(md_objs, tuple):
-                md_equ, md_prod = md_objs
-                md_equ.run(scheme['equilibration_steps'])
-                md_prod.set_atoms(md_equ.atoms)
-                md_prod.run(scheme['production_steps'])
-            else:
-                md = md_objs
-                md.run(scheme['total_simulation_steps'])
+            md_equ = create_md_equ(step, state['init_atoms'], sample_energy_fn)
+            md_equ.run(scheme['equilibration_steps'])
+            md_prod = create_md_prd(step, md_equ.atoms, sample_energy_fn)
+            md_prod.run(scheme['production_steps'])
             trajs_cg = read(f"{sampler_params['trajectory']}{step}.traj", index=':')
         else:
             logger.info(f"Reusing trajectory {step-1}")
@@ -269,15 +256,10 @@ def init_relative_entropy(
                 p = Path(f"{sampler_params['logfile']}{step}.log")
                 if p.exists():
                     p.unlink()
-            md_objs = create_md(step, sample_energy_fn)
-            if isinstance(md_objs, tuple):
-                md_equ, md_prod = md_objs
-                md_equ.run(scheme['equilibration_steps'])
-                md_prod.set_atoms(md_equ.atoms)
-                md_prod.run(scheme['production_steps'])
-            else:
-                md = md_objs
-                md.run(scheme['total_simulation_steps'])
+            md_equ = create_md_equ(step, state['init_atoms'], sample_energy_fn)
+            md_equ.run(scheme['equilibration_steps'])
+            md_prod = create_md_prd(step, md_equ.atoms, sample_energy_fn)
+            md_prod.run(scheme['production_steps'])
 
         # Placeholder loss; compute actual RE loss if needed
         leaves = jax.tree_util.tree_leaves(grad)

@@ -262,52 +262,43 @@ class IterativeBoltzmannInversion:
         return jnp.array(U_np)
 
     # MD helpers
-    def _create_md(self, step: int, energy_fn: Callable):
+    def _create_md_equ(self, step: int, init_atoms, energy_fn: Callable):
         calc = CustomCalculator(energy_fn, cutoff=self.cfg.r_cut)
         scheme = self.cfg.sim_time_scheme
         params = self.cfg.sampler_params
 
-        # Two-phase (equilibration + production) or single-phase
-        if "equilibration_steps" in scheme and "production_steps" in scheme:
-            md_equ = MolecularDynamics(
-                self.atoms,
-                custom_calculator=calc,
-                ensemble=params["ensemble"],
-                thermostat=params["thermostat"],
-                temperature=params["temperature"],
-                starting_temperature=params.get("starting_temperature", params["temperature"]),
-                timestep=params["timestep"],
-                trajectory=None,
-                logfile=None,
-                loginterval=None,
-            )
-            md_prod = MolecularDynamics(
-                self.atoms,
-                custom_calculator=calc,
-                ensemble=params["ensemble"],
-                thermostat=params["thermostat"],
-                temperature=params["temperature"],
-                starting_temperature=params.get("starting_temperature", params["temperature"]),
-                timestep=params["timestep"],
-                trajectory=f"{self.cfg.trajectory_prefix}{step}.traj",
-                logfile=f"{self.cfg.logfile_prefix}{step}.log",
-                loginterval=params.get("loginterval", 100),
-            )
-            return md_equ, md_prod
-        else:
-            md = MolecularDynamics(
-                self.atoms,
-                custom_calculator=calc,
-                ensemble=params["ensemble"],
-                thermostat=params["thermostat"],
-                temperature=params["temperature"],
-                starting_temperature=params.get("starting_temperature", params["temperature"]),
-                timestep=params["timestep"],
-                trajectory=f"{self.cfg.trajectory_prefix}{step}.traj",
-                logfile=f"{self.cfg.logfile_prefix}{step}.log",
-                loginterval=params.get("loginterval", 100),
-            )
-            return md
+        md_equ = MolecularDynamics(
+            init_atoms,
+            custom_calculator=calc,
+            ensemble=params["ensemble"],
+            thermostat=params["thermostat"],
+            temperature=params["temperature"],
+            starting_temperature=params.get("starting_temperature", params["temperature"]),
+            timestep=params["timestep"],
+            trajectory=None,
+            logfile=None,
+            loginterval=None,
+        )
+        return md_equ
+
+    def _create_md_prd(self, step: int, init_atoms, energy_fn: Callable):
+        calc = CustomCalculator(energy_fn, cutoff=self.cfg.r_cut)
+        scheme = self.cfg.sampler_params
+        params = self.cfg.sampler_params
+
+        md_prod = MolecularDynamics(
+            init_atoms,
+            custom_calculator=calc,
+            ensemble=params["ensemble"],
+            thermostat=params["thermostat"],
+            temperature=params["temperature"],
+            starting_temperature=params.get("starting_temperature", params["temperature"]),
+            timestep=params["timestep"],
+            trajectory=f"{self.cfg.trajectory_prefix}{step}.traj",
+            logfile=f"{self.cfg.logfile_prefix}{step}.log",
+            loginterval=params.get("loginterval", 100),
+        )
+        return md_prod
 
     # Observables
     def _build_quantity_fns(self) -> Dict[str, Dict[str, Any]]:
@@ -368,17 +359,12 @@ class IterativeBoltzmannInversion:
 
     def step(self, step_idx: int) -> Dict[str, Any]:
         energy_fn = self._build_energy_fn()
-        md_objs = self._create_md(step_idx, energy_fn)
         scheme = self.cfg.sim_time_scheme
 
-        if isinstance(md_objs, tuple):
-            md_equ, md_prod = md_objs
-            md_equ.run(scheme["equilibration_steps"])
-            md_prod.set_atoms(md_equ.atoms)
-            md_prod.run(scheme["production_steps"])
-        else:
-            md = md_objs
-            md.run(scheme["total_simulation_steps"])
+        md_equ = self._create_md_equ(step_idx, self.atoms, energy_fn)
+        md_equ.run(scheme["equilibration_steps"])
+        md_prod = self._create_md_prd(step_idx, md_equ.atoms, energy_fn)
+        md_prod.run(scheme["production_steps"])
 
         traj_path = f"{self.cfg.trajectory_prefix}{step_idx}.traj"
         observables = self._compute_observables(traj_path)
