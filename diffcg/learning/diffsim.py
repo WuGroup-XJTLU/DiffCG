@@ -513,7 +513,7 @@ def init_diffsim(
                 ensemble=sampler_params['ensemble'],
                 thermostat=sampler_params['thermostat'],
                 temperature=sampler_params['temperature'],
-                starting_temperature=sampler_params['starting_temperature'],
+                starting_temperature=None,
                 timestep=sampler_params['timestep'],
                 trajectory=f"{sampler_params['trajectory']}{step}.traj",
                 logfile=f"{sampler_params['logfile']}{step}.log",
