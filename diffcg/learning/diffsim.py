@@ -8,7 +8,7 @@ import optax
 import time
 from collections import namedtuple
 from typing import Optional, Dict
-from diffcg.md.calculator import CustomCalculator, CustomEnergyCalculator, init_energy_calculator
+from diffcg.md.calculator import CustomEnergyCalculator, init_energy_calculator
 from diffcg.learning.reweighting import ReweightEstimator
 from diffcg.system import trj_atom_to_system, System
 from diffcg.common.neighborlist import neighbor_list
@@ -108,29 +108,40 @@ class DiffSim():
             Boltzmann_constant=Boltzmann_constant,
         )
 
-    def obtain_sample_md(self,step,calculator):
+    def obtain_sample_md(self, step, energy_fn):
+        """Create MD objects for equilibration and production.
 
-        sample_md_equ = MolecularDynamics(self.init_atoms, 
-                                    custom_calculator=calculator, 
-                                    ensemble=self.sampler_params['ensemble'], 
-                                    thermostat=self.sampler_params['thermostat'], 
-                                    temperature=self.sampler_params['temperature'], 
-                                    starting_temperature=self.sampler_params['starting_temperature'],
-                                    timestep=self.sampler_params['timestep'], 
-                                    trajectory=None,
-                                    logfile=None,
-                                    loginterval=None)
+        Note: This method signature changed from (step, calculator) to (step, energy_fn).
+        """
+        sample_md_equ = MolecularDynamics(
+            self.init_atoms,
+            energy_fn=energy_fn,
+            ensemble=self.sampler_params['ensemble'],
+            thermostat=self.sampler_params['thermostat'],
+            temperature=self.sampler_params['temperature'],
+            starting_temperature=self.sampler_params['starting_temperature'],
+            timestep=self.sampler_params['timestep'],
+            cutoff=self.r_cut,
+            friction=self.sampler_params.get('friction', 1.0),
+            trajectory=None,
+            logfile=None,
+            loginterval=1,
+        )
 
-        sample_md_prod = MolecularDynamics(self.init_atoms, 
-                                    custom_calculator=calculator, 
-                                    ensemble=self.sampler_params['ensemble'], 
-                                    thermostat=self.sampler_params['thermostat'], 
-                                    temperature=self.sampler_params['temperature'], 
-                                    starting_temperature=self.sampler_params['starting_temperature'],
-                                    timestep=self.sampler_params['timestep'], 
-                                    trajectory=f"{self.sampler_params['trajectory']}{step}.traj",
-                                    logfile=f"{self.sampler_params['logfile']}{step}.log",
-                                    loginterval=self.sampler_params['loginterval'])
+        sample_md_prod = MolecularDynamics(
+            self.init_atoms,
+            energy_fn=energy_fn,
+            ensemble=self.sampler_params['ensemble'],
+            thermostat=self.sampler_params['thermostat'],
+            temperature=self.sampler_params['temperature'],
+            starting_temperature=self.sampler_params['starting_temperature'],
+            timestep=self.sampler_params['timestep'],
+            cutoff=self.r_cut,
+            friction=self.sampler_params.get('friction', 1.0),
+            trajectory=f"{self.sampler_params['trajectory']}{step}.traj",
+            logfile=f"{self.sampler_params['logfile']}{step}.log",
+            loginterval=self.sampler_params['loginterval'],
+        )
         return sample_md_equ, sample_md_prod
 
     def obtain_update_fn(self):
@@ -235,55 +246,43 @@ def init_multistate_diffsim(
     rerun_energy_by_state = {sid: build_rerun_energy_fn_for_state(sid) for sid in state_ids}
 
     def create_md_for_state_equ(state_id, step, init_atoms, sample_energy_fn):
-        """Create and return MD object(s) for the given state and step.
-
-        Returns either a tuple (md_equ, md_prod) for two-phase runs or a single md for one-phase.
-        """
+        """Create and return MD object for equilibration."""
         state = states[state_id]
         sampler_params = state['sampler_params']
         r_cut = state.get('r_cut', 1.0)
-        #init_atoms = state['init_atoms']
 
-        calculator = CustomCalculator(sample_energy_fn, cutoff=r_cut)
-
-        scheme = state['sim_time_scheme']
-        
         md_equ = MolecularDynamics(
             init_atoms,
-            custom_calculator=calculator,
+            energy_fn=sample_energy_fn,
             ensemble=sampler_params['ensemble'],
             thermostat=sampler_params['thermostat'],
             temperature=sampler_params['temperature'],
             starting_temperature=sampler_params['starting_temperature'],
             timestep=sampler_params['timestep'],
+            cutoff=r_cut,
+            friction=sampler_params.get('friction', 1.0),
             trajectory=None,
             logfile=None,
-            loginterval=None,
+            loginterval=1,
         )
         return md_equ
 
     def create_md_for_state_prd(state_id, step, init_atoms, sample_energy_fn):
-        """Create and return MD object(s) for the given state and step.
-
-        Returns either a tuple (md_equ, md_prod) for two-phase runs or a single md for one-phase.
-        """
+        """Create and return MD object for production."""
         state = states[state_id]
         sampler_params = state['sampler_params']
         r_cut = state.get('r_cut', 1.0)
-        #init_atoms = state['init_atoms']
 
-        calculator = CustomCalculator(sample_energy_fn, cutoff=r_cut)
-
-        scheme = state['sim_time_scheme']
-        
         md_prod = MolecularDynamics(
                 init_atoms,
-                custom_calculator=calculator,
+                energy_fn=sample_energy_fn,
                 ensemble=sampler_params['ensemble'],
                 thermostat=sampler_params['thermostat'],
                 temperature=sampler_params['temperature'],
                 starting_temperature=sampler_params['starting_temperature'],
-                timestep=sampler_params['timestep'] ,
+                timestep=sampler_params['timestep'],
+                cutoff=r_cut,
+                friction=sampler_params.get('friction', 1.0),
                 trajectory=f"{sampler_params['trajectory']}{step}.traj",
                 logfile=f"{sampler_params['logfile']}{step}.log",
                 loginterval=sampler_params['loginterval'],
@@ -483,38 +482,37 @@ def init_diffsim(
     def create_md_equ(step, init_atoms, sample_energy_fn):
         sampler_params = state['sampler_params']
         r_cut = state.get('r_cut', 1.0)
-        #init_atoms = state['init_atoms']
-        calculator = CustomCalculator(sample_energy_fn, cutoff=r_cut)
-        scheme = state['sim_time_scheme']
-        
+
         md_equ = MolecularDynamics(
             init_atoms,
-            custom_calculator=calculator,
+            energy_fn=sample_energy_fn,
             ensemble=sampler_params['ensemble'],
             thermostat=sampler_params['thermostat'],
             temperature=sampler_params['temperature'],
             starting_temperature=sampler_params['starting_temperature'],
             timestep=sampler_params['timestep'],
+            cutoff=r_cut,
+            friction=sampler_params.get('friction', 1.0),
             trajectory=None,
             logfile=None,
-            loginterval=None,
+            loginterval=1,
         )
         return md_equ
 
     def create_md_prd(step, init_atoms, sample_energy_fn):
         sampler_params = state['sampler_params']
         r_cut = state.get('r_cut', 1.0)
-        #init_atoms = state['init_atoms']
-        calculator = CustomCalculator(sample_energy_fn, cutoff=r_cut)
-        
+
         md_prod = MolecularDynamics(
                 init_atoms,
-                custom_calculator=calculator,
+                energy_fn=sample_energy_fn,
                 ensemble=sampler_params['ensemble'],
                 thermostat=sampler_params['thermostat'],
                 temperature=sampler_params['temperature'],
                 starting_temperature=None,
                 timestep=sampler_params['timestep'],
+                cutoff=r_cut,
+                friction=sampler_params.get('friction', 1.0),
                 trajectory=f"{sampler_params['trajectory']}{step}.traj",
                 logfile=f"{sampler_params['logfile']}{step}.log",
                 loginterval=sampler_params['loginterval'],

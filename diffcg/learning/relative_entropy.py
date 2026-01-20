@@ -14,7 +14,7 @@ from jax import lax
 from ase.io import read
 
 from diffcg.util.logger import get_logger
-from diffcg.md.calculator import CustomCalculator, CustomEnergyCalculator, init_energy_calculator
+from diffcg.md.calculator import CustomEnergyCalculator, init_energy_calculator
 from diffcg.learning.reweighting import ReweightEstimator
 from diffcg.system import trj_atom_to_system, System
 from diffcg.common.neighborlist import neighbor_list
@@ -93,38 +93,37 @@ def init_relative_entropy(
     def create_md_equ(step, init_atoms, sample_energy_fn):
         sampler_params = state['sampler_params']
         r_cut = state.get('r_cut', 1.0)
-        #init_atoms = state['init_atoms']
-        calculator = CustomCalculator(sample_energy_fn, cutoff=r_cut)
-        scheme = state['sim_time_scheme']
-        
+
         md_equ = MolecularDynamics(
             init_atoms,
-            custom_calculator=calculator,
+            energy_fn=sample_energy_fn,
             ensemble=sampler_params['ensemble'],
             thermostat=sampler_params['thermostat'],
             temperature=sampler_params['temperature'],
             starting_temperature=sampler_params['starting_temperature'],
             timestep=sampler_params['timestep'],
+            cutoff=r_cut,
+            friction=sampler_params.get('friction', 1.0),
             trajectory=None,
             logfile=None,
-            loginterval=None,
+            loginterval=1,
         )
         return md_equ
 
     def create_md_prd(step, init_atoms, sample_energy_fn):
         sampler_params = state['sampler_params']
         r_cut = state.get('r_cut', 1.0)
-        #init_atoms = state['init_atoms']
-        calculator = CustomCalculator(sample_energy_fn, cutoff=r_cut)
-        
+
         md_prod = MolecularDynamics(
                 init_atoms,
-                custom_calculator=calculator,
+                energy_fn=sample_energy_fn,
                 ensemble=sampler_params['ensemble'],
                 thermostat=sampler_params['thermostat'],
                 temperature=sampler_params['temperature'],
                 starting_temperature=sampler_params['starting_temperature'],
                 timestep=sampler_params['timestep'],
+                cutoff=r_cut,
+                friction=sampler_params.get('friction', 1.0),
                 trajectory=f"{sampler_params['trajectory']}{step}.traj",
                 logfile=f"{sampler_params['logfile']}{step}.log",
                 loginterval=sampler_params['loginterval'],

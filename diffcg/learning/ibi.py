@@ -12,7 +12,7 @@ import jax.numpy as jnp
 from ase import units
 
 from diffcg import energy as energy_mod
-from diffcg.md.calculator import CustomCalculator
+# CustomCalculator removed - MD now uses energy_fn directly
 from diffcg.md.sample import MolecularDynamics
 from diffcg.observable.analyze import analyze
 from diffcg.observable.structure import (
@@ -263,37 +263,37 @@ class IterativeBoltzmannInversion:
 
     # MD helpers
     def _create_md_equ(self, step: int, init_atoms, energy_fn: Callable):
-        calc = CustomCalculator(energy_fn, cutoff=self.cfg.r_cut)
-        scheme = self.cfg.sim_time_scheme
         params = self.cfg.sampler_params
 
         md_equ = MolecularDynamics(
             init_atoms,
-            custom_calculator=calc,
+            energy_fn=energy_fn,
             ensemble=params["ensemble"],
             thermostat=params["thermostat"],
             temperature=params["temperature"],
             starting_temperature=params.get("starting_temperature", params["temperature"]),
             timestep=params["timestep"],
+            cutoff=self.cfg.r_cut,
+            friction=params.get("friction", 1.0),
             trajectory=None,
             logfile=None,
-            loginterval=None,
+            loginterval=1,
         )
         return md_equ
 
     def _create_md_prd(self, step: int, init_atoms, energy_fn: Callable):
-        calc = CustomCalculator(energy_fn, cutoff=self.cfg.r_cut)
-        scheme = self.cfg.sampler_params
         params = self.cfg.sampler_params
 
         md_prod = MolecularDynamics(
             init_atoms,
-            custom_calculator=calc,
+            energy_fn=energy_fn,
             ensemble=params["ensemble"],
             thermostat=params["thermostat"],
             temperature=params["temperature"],
             starting_temperature=params.get("starting_temperature", params["temperature"]),
             timestep=params["timestep"],
+            cutoff=self.cfg.r_cut,
+            friction=params.get("friction", 1.0),
             trajectory=f"{self.cfg.trajectory_prefix}{step}.traj",
             logfile=f"{self.cfg.logfile_prefix}{step}.log",
             loginterval=params.get("loginterval", 100),

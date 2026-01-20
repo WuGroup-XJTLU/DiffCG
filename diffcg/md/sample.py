@@ -1,47 +1,45 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 WuResearchGroup
 
-from ase import Atoms
-import numpy as np
+"""Molecular dynamics sampling module using JAX-MD.
+
+This module provides the MolecularDynamics class that wraps JAX-MD integrators
+for NVE, NVT (Langevin/Nose-Hoover), and NPT (Nose-Hoover) ensembles.
+
+Note: Berendsen thermostat is not supported as JAX-MD does not provide it.
+Use 'langevin' or 'nose-hoover' thermostats instead.
+"""
+
+from typing import Callable, Optional, List
 import pickle
-from ase import Atoms, units
-from ase.calculators.calculator import (
-    BaseCalculator,
-    Calculator,
-    all_changes,
-    all_properties,
-)
-from ase.md.langevin import Langevin
-from ase.md.nvtberendsen import NVTBerendsen
-from ase.md.npt import NPT
-from ase.md.nptberendsen import Inhomogeneous_NPTBerendsen, NPTBerendsen, NVTBerendsen
-from ase.md.velocitydistribution import MaxwellBoltzmannDistribution, Stationary
-from ase.md.verlet import VelocityVerlet
+
+import numpy as np
+import jax
+import jax.numpy as jnp
+from jax import random
+from ase import Atoms
+from ase.io.trajectory import Trajectory
+
+from diffcg.system import System
+from diffcg.md.jaxmd_sampler import JAXMDSampler, MDResult
 from diffcg.util.logger import get_logger
 
 logger = get_logger(__name__)
 
+
 class TrajectoryObserver:
-    """Trajectory observer is a hook in the relaxation process that saves the
-    intermediate structures.
-    """
+    """Trajectory observer that saves intermediate structures during MD."""
 
     def __init__(self, atoms: Atoms) -> None:
-        """Create a TrajectoryObserver from an Atoms object.
-
-        Args:
-            atoms (Atoms): the structure to observe.
-        """
         self.atoms = atoms
-        self.energies: list[float] = []
-        self.forces: list[np.ndarray] = []
-        self.stresses: list[np.ndarray] = []
-        self.magmoms: list[np.ndarray] = []
-        self.atom_positions: list[np.ndarray] = []
-        self.cells: list[np.ndarray] = []
+        self.energies: List[float] = []
+        self.forces: List[np.ndarray] = []
+        self.stresses: List[np.ndarray] = []
+        self.magmoms: List[np.ndarray] = []
+        self.atom_positions: List[np.ndarray] = []
+        self.cells: List[np.ndarray] = []
 
     def __call__(self) -> None:
-        """The logic for saving the properties of an Atoms during the relaxation."""
         self.energies.append(self.compute_energy())
         self.forces.append(self.atoms.get_forces())
         self.stresses.append(self.atoms.get_stress())
@@ -50,23 +48,12 @@ class TrajectoryObserver:
         self.cells.append(self.atoms.get_cell()[:])
 
     def __len__(self) -> int:
-        """The number of steps in the trajectory."""
         return len(self.energies)
 
     def compute_energy(self) -> float:
-        """Calculate the potential energy.
-
-        Returns:
-            energy (float): the potential energy.
-        """
         return self.atoms.get_potential_energy()
 
     def save(self, filename: str) -> None:
-        """Save the trajectory to file.
-
-        Args:
-            filename (str): filename to save the trajectory
-        """
         out_pkl = {
             "energy": self.energies,
             "forces": self.forces,
@@ -80,321 +67,237 @@ class TrajectoryObserver:
             pickle.dump(out_pkl, file)
 
 
+def trajectory_to_atoms(
+    positions_trajectory: jnp.ndarray,
+    atomic_numbers: jnp.ndarray,
+    cell: Optional[jnp.ndarray],
+    pbc: bool = True,
+) -> List[Atoms]:
+    """Convert JAX trajectory array to list of ASE Atoms."""
+    atoms_list = []
+    positions_np = np.array(positions_trajectory)
+    numbers_np = np.array(atomic_numbers)
+
+    if cell is not None:
+        cell_np = np.array(cell).T
+    else:
+        cell_np = None
+        pbc = False
+
+    for pos in positions_np:
+        atoms = Atoms(positions=pos, numbers=numbers_np, cell=cell_np, pbc=pbc)
+        atoms_list.append(atoms)
+
+    return atoms_list
+
+
+def atoms_to_trajectory(atoms_list: List[Atoms]) -> tuple:
+    """Convert list of ASE Atoms to JAX arrays."""
+    positions = jnp.stack([jnp.array(a.get_positions()) for a in atoms_list])
+    atomic_numbers = jnp.array(atoms_list[0].get_atomic_numbers())
+
+    if atoms_list[0].get_pbc().any():
+        cell = jnp.array(atoms_list[0].get_cell()[:].T)
+    else:
+        cell = None
+
+    return positions, atomic_numbers, cell
+
+
 class MolecularDynamics:
-    """Molecular dynamics class."""
+    """Molecular dynamics class using JAX-MD integrators.
+
+    Note: Berendsen thermostats are not supported. Use 'langevin' or 'nose-hoover'.
+    """
 
     def __init__(
         self,
         atoms: Atoms,
         *,
-        custom_calculator,
+        energy_fn: Callable,
         ensemble: str = "nvt",
-        thermostat: str = "Berendsen_inhomogeneous",
-        temperature: int = 300,
-        starting_temperature = None,
+        thermostat: str = "langevin",
+        temperature: float = 300.0,
+        starting_temperature: Optional[float] = None,
         timestep: float = 2.0,
+        cutoff: float = 1.0,
         pressure: float = 1.01325e-4,
-        taut = None,
-        taup = None,
-        bulk_modulus = None,
-        trajectory = None,
-        logfile = None,
+        taut: Optional[float] = None,
+        taup: Optional[float] = None,
+        trajectory: Optional[str] = None,
+        logfile: Optional[str] = None,
         loginterval: int = 1,
-        append_trajectory: bool = False,
-        use_device = None,
-        **dynamic_kwargs,
+        capacity_multiplier: float = 1.25,
+        random_seed: int = 0,
+        friction: float = 1.0,
+        **kwargs,
     ) -> None:
-        """Initialize the MD class.
+        # Validate thermostat
+        if thermostat.lower().startswith('berendsen'):
+            raise ValueError(
+                "Berendsen thermostat is not supported in JAX-MD. "
+                "Use 'langevin' or 'nose-hoover' instead."
+            )
 
-        Args:
-            atoms (Atoms): atoms to run the MD
-            model (CHGNet): instance of a CHGNet model or CHGNetCalculator.
-                If set to None, the pretrained CHGNet is loaded.
-                Default = None
-            ensemble (str): choose from 'nve', 'nvt', 'npt'
-                Default = "nvt"
-            thermostat (str): Thermostat to use
-                choose from "Nose-Hoover", "Berendsen", "Berendsen_inhomogeneous"
-                Default = "Berendsen_inhomogeneous"
-            temperature (float): temperature for MD simulation, in K
-                Default = 300
-            starting_temperature (float): starting temperature of MD simulation, in K
-                if set as None, the MD starts with the momentum carried by ase.Atoms
-                if input is a pymatgen.core.Structure, the MD starts at 0K
-                Default = None
-            timestep (float): time step in fs
-                Default = 2
-            pressure (float): pressure in GPa
-                Can be 3x3 or 6 np.array if thermostat is "Nose-Hoover"
-                Default = 1.01325e-4 GPa = 1 atm
-            taut (float): time constant for temperature coupling in fs.
-                The temperature will be raised to target temperature in approximate
-                10 * taut time.
-                Default = 100 * timestep
-            taup (float): time constant for pressure coupling in fs
-                Default = 1000 * timestep
-            bulk_modulus (float): bulk modulus of the material in GPa.
-                Used in NPT ensemble for the barostat pressure coupling.
-                The DFT bulk modulus can be found for most materials at
-                https://next-gen.materialsproject.org/
+        self.ensemble = ensemble.lower()
+        self.thermostat = thermostat.lower()
+        self.temperature = temperature
+        self.timestep = timestep
+        self.cutoff = cutoff
+        self.trajectory_path = trajectory
+        self.logfile = logfile
+        self.loginterval = loginterval if loginterval is not None else 1
+        self.random_seed = random_seed
 
-                In NPT ensemble, the effective damping time for pressure is multiplied
-                by compressibility. In LAMMPS, Bulk modulus is defaulted to 10
-                see: https://docs.lammps.org/fix_press_berendsen.html
-                and: https://gitlab.com/ase/ase/-/blob/master/ase/md/nptberendsen.py
+        self._original_atoms = atoms.copy()
+        self.atoms = atoms
 
-                If bulk modulus is not provided here, it will be calculated by CHGNet
-                through Birch Murnaghan equation of state (EOS).
-                Note the EOS fitting can fail because of non-parabolic potential
-                energy surface, which is common with soft system like liquid and gas.
-                In such case, user should provide an input bulk modulus for better
-                barostat coupling, otherwise a guessed bulk modulus = 2 GPa will be used
-                (water's bulk modulus)
+        self.positions = jnp.array(atoms.get_positions())
+        self.atomic_numbers = jnp.array(atoms.get_atomic_numbers())
 
-                Default = None
-            trajectory (str or Trajectory): Attach trajectory object
-                Default = None
-            logfile (str): open this file for recording MD outputs
-                Default = None
-            loginterval (int): write to log file every interval steps
-                Default = 1
-            crystal_feas_logfile (str): open this file for recording crystal features
-                during MD. Default = None
-            append_trajectory (bool): Whether to append to prev trajectory.
-                If false, previous trajectory gets overwritten
-                Default = False
-            on_isolated_atoms ('ignore' | 'warn' | 'error'): how to handle Structures
-                with isolated atoms.
-                Default = 'warn'
-            return_site_energies (bool): whether to return the energy of each atom
-            use_device (str): the device for the MD run
-                Default = None
-        """
-        self.ensemble = ensemble
-        self.thermostat = thermostat
+        if atoms.get_pbc().any():
+            self.cell = jnp.array(atoms.get_cell()[:].T)
+        else:
+            self.cell = None
 
         if starting_temperature is not None:
-            MaxwellBoltzmannDistribution(
-                atoms, temperature_K=starting_temperature, force_temp=True
-            )
-            Stationary(atoms)
+            self._initialize_velocities(starting_temperature)
 
-        self.atoms = atoms
+        self.sampler = JAXMDSampler(
+            energy_fn=energy_fn,
+            Z=self.atomic_numbers,
+            cell=self.cell,
+            cutoff=cutoff,
+            ensemble=ensemble,
+            thermostat=thermostat,
+            temperature=temperature,
+            timestep=timestep,
+            pressure=pressure,
+            taut=taut,
+            taup=taup,
+            friction=friction,
+            capacity_multiplier=capacity_multiplier,
+            **kwargs,
+        )
 
-        self.atoms.calc = custom_calculator
+        self.trajectory: List[jnp.ndarray] = []
+        self._md_result: Optional[MDResult] = None
+        self._key = random.PRNGKey(random_seed)
+        self._neighbor = None
+        self._state = None
 
-        self.calculator = custom_calculator
+        logger.info(
+            "Created MolecularDynamics: ensemble=%s, thermostat=%s, T=%s K, dt=%s fs",
+            self.ensemble,
+            self.thermostat if self.ensemble == 'nvt' else 'n/a',
+            temperature,
+            timestep,
+        )
 
-        timestep = timestep * 0.1 # the length scale is in nm, the time unit is \AA \sqrt(u/eV), where AA is angstrom, u is atomic mass, and eV is energy unit
+    def _initialize_velocities(self, temperature: float) -> None:
+        from ase.md.velocitydistribution import MaxwellBoltzmannDistribution, Stationary
+        MaxwellBoltzmannDistribution(self.atoms, temperature_K=temperature, force_temp=True)
+        Stationary(self.atoms)
+        logger.debug("Initialized velocities at T=%s K", temperature)
 
-        if taut is None:
-            taut = 100 * timestep
-        if taup is None:
-            taup = 1000 * timestep
-
-        if ensemble.lower() == "nve":
-            """
-            VelocityVerlet (constant N, V, E) molecular dynamics.
-
-            Note: it's recommended to use smaller timestep for NVE compared to other
-            ensembles, since the VelocityVerlet algorithm assumes a strict conservative
-            force field.
-            """
-            self.dyn = VelocityVerlet(
-                atoms=self.atoms,
-                timestep=timestep * units.fs,
-                trajectory=trajectory,
-                logfile=logfile,
-                loginterval=loginterval,
-                append_trajectory=append_trajectory,
-            )
-            logger.info("Created NVE MD: timestep=%s fs, loginterval=%s", timestep*10, loginterval)
-
-        elif ensemble.lower() == "nvt":
-            """
-            Constant volume/temperature molecular dynamics.
-            """
-            if thermostat.lower() == "nose-hoover":
-                """
-                Nose-hoover (constant N, V, T) molecular dynamics.
-                ASE implementation currently only supports upper triangular lattice
-                """
-                self.upper_triangular_cell()
-                self.dyn = NPT(
-                    atoms=self.atoms,
-                    timestep=timestep * units.fs,
-                    temperature_K=temperature,
-                    externalstress=pressure
-                    * units.GPa,  # ase NPT does not like externalstress=None
-                    ttime=taut * units.fs,
-                    pfactor=None,
-                    trajectory=trajectory,
-                    logfile=logfile,
-                    loginterval=loginterval,
-                    append_trajectory=append_trajectory,
-                )
-                logger.info("Created NVT (Nose-Hoover) MD: T=%s K, timestep=%s fs", temperature, timestep*10)
-            elif thermostat.lower() == "langevin":
-                self.dyn = Langevin(
-                    atoms=self.atoms,
-                    timestep=timestep * units.fs,
-                    temperature_K=temperature,
-                    friction=dynamic_kwargs["friction"],
-                    trajectory=trajectory,
-                    logfile=logfile,
-                    loginterval=loginterval,
-                    append_trajectory=append_trajectory
-                )
-                logger.info("Created NVT (Langevin) MD: T=%s K, timestep=%s fs", temperature, timestep*10)
-            elif thermostat.lower().startswith("berendsen"):
-                """
-                Berendsen (constant N, V, T) molecular dynamics.
-                """
-                self.dyn = NVTBerendsen(
-                    atoms=self.atoms,
-                    timestep=timestep * units.fs,
-                    temperature_K=temperature,
-                    taut=taut * units.fs,
-                    trajectory=trajectory,
-                    logfile=logfile,
-                    loginterval=loginterval,
-                    append_trajectory=append_trajectory,
-                )
-                logger.info("Created NVT (Berendsen) MD: T=%s K, timestep=%s fs", temperature, timestep*10)
-            else:
-                raise ValueError(
-                    "Thermostat not supported, choose in 'Nose-Hoover', 'Berendsen', "
-                    "'Berendsen_inhomogeneous'"
-                )
-
-        elif ensemble.lower() == "npt":
-            """
-            Constant pressure/temperature molecular dynamics.
-            """
-            # Bulk modulus is needed for pressure damping time
-            if bulk_modulus is not None:
-                bulk_modulus_au = bulk_modulus / 160.2176  # GPa to eV/A^3
-                compressibility_au = 1 / bulk_modulus_au
-            else:
-                try:
-                    # Fit bulk modulus by equation of state
-                    eos = EquationOfState(model=self.atoms.calc)
-                    eos.fit(atoms=atoms, steps=500, fmax=0.1, verbose=False)
-                    bulk_modulus = eos.get_bulk_modulus(unit="GPa")
-                    bulk_modulus_au = eos.get_bulk_modulus(unit="eV/A^3")
-                    compressibility_au = eos.get_compressibility(unit="A^3/eV")
-                    print(
-                        f"Completed bulk modulus calculation: "
-                        f"k = {bulk_modulus:.3}GPa, {bulk_modulus_au:.3}eV/A^3"
-                    )
-                except Exception:
-                    bulk_modulus_au = 2 / 160.2176
-                    compressibility_au = 1 / bulk_modulus_au
-                    warnings.warn(
-                        "Warning!!! Equation of State fitting failed, setting bulk "
-                        "modulus to 2 GPa. NPT simulation can proceed with incorrect "
-                        "pressure relaxation time."
-                        "User input for bulk modulus is recommended.",
-                        stacklevel=2,
-                    )
-            self.bulk_modulus = bulk_modulus
-
-            if thermostat.lower() == "nose-hoover":
-                """
-                Combined Nose-Hoover and Parrinello-Rahman dynamics, creating an
-                NPT (or N,stress,T) ensemble.
-                see: https://gitlab.com/ase/ase/-/blob/master/ase/md/npt.py
-                ASE implementation currently only supports upper triangular lattice
-                """
-                self.upper_triangular_cell()
-                ptime = taup * units.fs
-                self.dyn = NPT(
-                    atoms=self.atoms,
-                    timestep=timestep * units.fs,
-                    temperature_K=temperature,
-                    externalstress=pressure * units.GPa,
-                    ttime=taut * units.fs,
-                    pfactor=bulk_modulus * units.GPa * ptime * ptime,
-                    trajectory=trajectory,
-                    logfile=logfile,
-                    loginterval=loginterval,
-                    append_trajectory=append_trajectory,
-                )
-                logger.info("Created NPT (Nose-Hoover) MD: T=%s K, P=%s GPa, timestep=%s fs", temperature, pressure, timestep*10)
-
-            elif thermostat.lower() == "berendsen_inhomogeneous":
-                """
-                Inhomogeneous_NPTBerendsen thermo/barostat
-                This is a more flexible scheme that fixes three angles of the unit
-                cell but allows three lattice parameter to change independently.
-                see: https://gitlab.com/ase/ase/-/blob/master/ase/md/nptberendsen.py
-                """
-
-                self.dyn = Inhomogeneous_NPTBerendsen(
-                    atoms=self.atoms,
-                    timestep=timestep * units.fs,
-                    temperature_K=temperature,
-                    pressure_au=pressure * units.GPa,
-                    taut=taut * units.fs,
-                    taup=taup * units.fs,
-                    compressibility_au=compressibility_au,
-                    trajectory=trajectory,
-                    logfile=logfile,
-                    loginterval=loginterval,
-                )
-                logger.info("Created NPT (Berendsen inhomogeneous) MD: T=%s K, P=%s GPa, timestep=%s fs", temperature, pressure, timestep*10)
-
-            elif thermostat.lower() == "npt_berendsen":
-                """
-                This is a similar scheme to the Inhomogeneous_NPTBerendsen.
-                This is a less flexible scheme that fixes the shape of the
-                cell - three angles are fixed and the ratios between the three
-                lattice constants.
-                see: https://gitlab.com/ase/ase/-/blob/master/ase/md/nptberendsen.py
-                """
-
-                self.dyn = NPTBerendsen(
-                    atoms=self.atoms,
-                    timestep=timestep * units.fs,
-                    temperature_K=temperature,
-                    pressure_au=pressure * units.GPa,
-                    taut=taut * units.fs,
-                    taup=taup * units.fs,
-                    compressibility_au=compressibility_au,
-                    trajectory=trajectory,
-                    logfile=logfile,
-                    loginterval=loginterval,
-                    append_trajectory=append_trajectory,
-                )
-                logger.info("Created NPT (Berendsen) MD: T=%s K, P=%s GPa, timestep=%s fs", temperature, pressure, timestep*10)
-            else:
-                raise ValueError(
-                    "Thermostat not supported, choose in 'Nose-Hoover', 'Berendsen', "
-                    "'Berendsen_inhomogeneous'"
-                )
-
-        self.trajectory = trajectory
-        self.logfile = logfile
-        self.loginterval = loginterval
-        self.timestep = timestep
-
-    def run(self, steps: int) -> None:
-        """Thin wrapper of ase MD run.
-
-        Args:
-            steps (int): number of MD steps
-        """
+    def run(self, steps: int) -> jnp.ndarray:
         logger.info("Running MD for %s steps", steps)
-        self.dyn.run(steps)
-        logger.info("MD completed")
+
+        self._key, subkey = random.split(self._key)
+        result = self.sampler.run(
+            R=self.positions,
+            steps=steps,
+            key=subkey,
+            neighbor=self._neighbor,
+            save_frequency=self.loginterval,
+        )
+
+        self._md_result = result
+        self._neighbor = result.final_neighbors
+        self._state = result.final_state
+        self.positions = result.final_state.position
+        self.atoms.set_positions(np.array(self.positions))
+        self.trajectory = result.trajectory
+
+        if self.trajectory_path is not None:
+            self._save_trajectory(result.trajectory)
+
+        if self.logfile is not None:
+            self._write_log(steps)
+
+        logger.info("MD completed, %s frames saved", len(result.trajectory))
+        return result.trajectory
+
+    def _save_trajectory(self, trajectory: jnp.ndarray) -> None:
+        atoms_list = trajectory_to_atoms(
+            trajectory,
+            self.atomic_numbers,
+            self.cell,
+            pbc=self._original_atoms.get_pbc().any(),
+        )
+
+        with Trajectory(self.trajectory_path, 'w') as traj:
+            for atoms in atoms_list:
+                traj.write(atoms)
+
+        logger.debug("Saved trajectory to %s", self.trajectory_path)
+
+    def _write_log(self, steps: int) -> None:
+        with open(self.logfile, 'a') as f:
+            f.write(f"# JAX-MD Simulation Log\n")
+            f.write(f"# Ensemble: {self.ensemble}\n")
+            f.write(f"# Thermostat: {self.thermostat}\n")
+            f.write(f"# Temperature: {self.temperature} K\n")
+            f.write(f"# Timestep: {self.timestep} fs\n")
+            f.write(f"# Steps: {steps}\n")
+            f.write(f"# Frames saved: {len(self.trajectory)}\n")
 
     def set_atoms(self, atoms: Atoms) -> None:
-        """Set new atoms to run MD.
-
-        Args:
-            atoms (Atoms): new atoms for running MD
-        """
-        #calculator = self.atoms.calc
         self.atoms = atoms
-        self.dyn.atoms = atoms
-        self.dyn.atoms.calc = self.calculator
+        self.positions = jnp.array(atoms.get_positions())
+
+        if atoms.get_pbc().any():
+            new_cell = jnp.array(atoms.get_cell()[:].T)
+            if self.cell is None or not jnp.allclose(new_cell, self.cell):
+                self.cell = new_cell
+                logger.warning("Cell changed, sampler may need to be recreated for NPT")
+        else:
+            self.cell = None
+
+        self._neighbor = None
+
+    def get_trajectory_as_atoms(self) -> List[Atoms]:
+        if len(self.trajectory) == 0:
+            return []
+
+        return trajectory_to_atoms(
+            self.trajectory,
+            self.atomic_numbers,
+            self.cell,
+            pbc=self._original_atoms.get_pbc().any(),
+        )
+
+    def get_final_system(self) -> System:
+        return System(R=self.positions, Z=self.atomic_numbers, cell=self.cell)
+
+
+def create_molecular_dynamics(
+    atoms: Atoms,
+    energy_fn: Callable,
+    ensemble: str = "nvt",
+    thermostat: str = "langevin",
+    temperature: float = 300.0,
+    timestep: float = 2.0,
+    cutoff: float = 1.0,
+    **kwargs,
+) -> MolecularDynamics:
+    return MolecularDynamics(
+        atoms=atoms,
+        energy_fn=energy_fn,
+        ensemble=ensemble,
+        thermostat=thermostat,
+        temperature=temperature,
+        timestep=timestep,
+        cutoff=cutoff,
+        **kwargs,
+    )
