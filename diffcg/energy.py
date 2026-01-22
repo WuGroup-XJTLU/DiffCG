@@ -208,6 +208,29 @@ def mask_bonded_neighbors(idx, topology, max_num_atoms):
     return i_masked,j_masked
 
 
+def _get_edge_list_from_jaxmd_neighbors(neighbors):
+    """Convert JAX-MD Sparse neighbor list to edge-list format.
+
+    JAX-MD Sparse format: neighbors.idx with shape [N, max_neighbors]
+      - idx[i, j] = j-th neighbor of particle i
+      - Padding value = N for unused slots
+
+    Args:
+        neighbors: JAX-MD neighbor list object with .idx attribute
+
+    Returns:
+        Tuple of (centers, others, N) where:
+          - centers: 1D array of center atom indices
+          - others: 1D array of neighbor atom indices
+          - N: Number of particles (from neighbor list)
+    """
+    idx = neighbors.idx
+    N = idx.shape[0]
+    max_neighbors = idx.shape[1]
+    centers = jnp.repeat(jnp.arange(N), max_neighbors)
+    others = idx.flatten()
+    return centers, others, N
+
 
 class TabulatedBondEnergy:
     def __init__(self, x_vals, y_vals,bonds):
@@ -337,16 +360,18 @@ class GenericRepulsionEnergy:
         if self.mask_topology is None:
             def energy_fn(system, neighbors, **dynamic_kwargs):
                 positions = system.R
-                nodes = system.Z
-                
+
+                # Convert JAX-MD neighbor list to edge list
+                centers, others, N = _get_edge_list_from_jaxmd_neighbors(neighbors)
+
                 edges = vmap(partial(displacement, system.cell))(
-                    positions[neighbors.centers], positions[neighbors.others]
+                    positions[centers], positions[others]
                 )
                 dr = vmap(distance)(edges)
-                
+
                 _energy = multiplicative_isotropic_cutoff(generic_repulsion, self.r_onset, self.r_cutoff)(dr, self.sigma, self.epsilon, self.exp)
-                mask = neighbors.centers != positions.shape[0]
-                
+                mask = others < N  # Filter padding (JAX-MD uses N as padding value for unused neighbor slots)
+
                 out = _energy * mask
                 return high_precision_sum(out) * 0.5
 
@@ -354,21 +379,18 @@ class GenericRepulsionEnergy:
         else:
             def energy_fn(system, neighbors, **dynamic_kwargs):
                 positions = system.R
-                nodes = system.Z
 
-                mask_centers,mask_others = mask_bonded_neighbors((neighbors.centers,neighbors.others),self.mask_topology,self.max_num_atoms)
-                mask = mask_centers < positions.shape[0]
-                #for i in range(len(mask_centers)):
-                #    print(mask_centers[i],mask_others[i],neighbors.centers[i],neighbors.others[i])
+                # Convert JAX-MD neighbor list to edge list
+                centers, others, N = _get_edge_list_from_jaxmd_neighbors(neighbors)
+
+                mask_centers, mask_others = mask_bonded_neighbors((centers, others), self.mask_topology, self.max_num_atoms)
+                mask = mask_centers < N
 
                 edges = vmap(partial(displacement, system.cell))(
-                    positions[neighbors.centers], positions[neighbors.others]
+                    positions[centers], positions[others]
                 )
-                #for i in range(edges.shape[0]):
-                #    print(edges[i])
-
                 dr = vmap(distance)(edges)
-                
+
                 _energy = multiplicative_isotropic_cutoff(generic_repulsion, self.r_onset, self.r_cutoff)(dr, self.sigma, self.epsilon, self.exp)
                 out = _energy * mask
                 return high_precision_sum(out) * 0.5
@@ -392,17 +414,18 @@ class TabulatedPairEnergy:
         if self.mask_topology is None:
             def energy_fn(system, neighbors, **dynamic_kwargs):
                 positions = system.R
-                nodes = system.Z
-                
+
+                # Convert JAX-MD neighbor list to edge list
+                centers, others, N = _get_edge_list_from_jaxmd_neighbors(neighbors)
+
                 edges = vmap(partial(displacement, system.cell))(
-                    positions[neighbors.centers], positions[neighbors.others]
+                    positions[centers], positions[others]
                 )
                 dr = vmap(distance)(edges)
-                
-                truncated_fn=multiplicative_isotropic_cutoff(tabulated_partial, self.r_onset,
-                                                self.r_cutoff)
-                mask = neighbors.centers != positions.shape[0]
-                
+
+                truncated_fn = multiplicative_isotropic_cutoff(tabulated_partial, self.r_onset, self.r_cutoff)
+                mask = others < N  # Filter padding
+
                 _energy = truncated_fn(dr)
                 out = _energy * mask
                 return high_precision_sum(out) * 0.5
@@ -411,19 +434,20 @@ class TabulatedPairEnergy:
         else:
             def energy_fn(system, neighbors, **dynamic_kwargs):
                 positions = system.R
-                nodes = system.Z
 
-                mask_centers,mask_others = mask_bonded_neighbors((neighbors.centers,neighbors.others),self.mask_topology,self.max_num_atoms)
-                mask = mask_centers < positions.shape[0]
-                
+                # Convert JAX-MD neighbor list to edge list
+                centers, others, N = _get_edge_list_from_jaxmd_neighbors(neighbors)
+
+                mask_centers, mask_others = mask_bonded_neighbors((centers, others), self.mask_topology, self.max_num_atoms)
+                mask = mask_centers < N
+
                 edges = vmap(partial(displacement, system.cell))(
-                    positions[neighbors.centers], positions[neighbors.others]
+                    positions[centers], positions[others]
                 )
                 dr = vmap(distance)(edges)
-                
-                truncated_fn=multiplicative_isotropic_cutoff(tabulated_partial, self.r_onset,
-                                                self.r_cutoff)
-                
+
+                truncated_fn = multiplicative_isotropic_cutoff(tabulated_partial, self.r_onset, self.r_cutoff)
+
                 _energy = truncated_fn(dr)
                 out = _energy * mask
                 return high_precision_sum(out) * 0.5

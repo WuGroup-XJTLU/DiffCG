@@ -7,10 +7,6 @@ import jax
 import jax.numpy as jnp
 from jax_md import space, partition
 
-SpatialPartitioning = namedtuple(
-    "SpatialPartitioning", ("allocate_fn", "update_fn", "cutoff", "skin", "capacity_multiplier")
-)
-
 # JAX-MD based spatial partitioning
 JAXMDSpatialPartitioning = namedtuple(
     "JAXMDSpatialPartitioning",
@@ -90,36 +86,3 @@ def jaxmd_update_neighbor_list(
 ):
     """Update JAX-MD neighbor list."""
     return spatial_partitioning.neighbor_fn.update(positions, neighbors)
-
-
-def neighbor_list(positions: jnp.ndarray, cutoff: float, skin: float, cell: jnp.ndarray = None,
-                  capacity_multiplier: float = 1.4):
-    """GLP-based neighbor list (legacy interface).
-
-    Args:
-        positions: Particle positions.
-        cutoff: Cutoff distance.
-        skin: Skin distance for neighbor list.
-        cell: Unit cell matrix (column-major format).
-        capacity_multiplier: Buffer multiplier.
-
-    Returns:
-        Tuple of (neighbors, SpatialPartitioning).
-    """
-    try:
-        from glp.neighborlist import quadratic_neighbor_list
-    except ImportError:
-        raise ImportError('For neighborhood list, please install the glp package from ...')
-
-    allocate, update = quadratic_neighbor_list(
-        cell, cutoff, skin, capacity_multiplier=capacity_multiplier
-    )
-
-    neighbors = allocate(positions)
-
-    return neighbors, SpatialPartitioning(allocate_fn=allocate,
-                                          update_fn=jax.jit(update),
-                                          cutoff=cutoff,
-                                          skin=skin,
-                                          capacity_multiplier=capacity_multiplier)
-

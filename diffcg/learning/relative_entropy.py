@@ -17,7 +17,7 @@ from diffcg.util.logger import get_logger
 from diffcg.md.calculator import CustomEnergyCalculator, init_energy_calculator
 from diffcg.learning.reweighting import ReweightEstimator
 from diffcg.system import trj_atom_to_system, System
-from diffcg.common.neighborlist import neighbor_list
+from diffcg.common.neighborlist import jaxmd_neighbor_list
 from diffcg.md.sample import MolecularDynamics
 
 def _tree_sum_batch(tree, axis: int = 0):
@@ -180,19 +180,18 @@ def init_relative_entropy(
 
         def precompute_neighbors_batched(batched_system: System):
             batch_size = batched_system.R.shape[0]
-            # Allocate on first frame to fix capacities; reuse for others via update_fn
+            # Allocate on first frame to fix capacities; reuse for others via update
             sys0 = System(R=batched_system.R[0], Z=batched_system.Z[0], cell=batched_system.cell[0])
-            neighbors0, spatial_partitioning = neighbor_list(
+            neighbors0, spatial_partitioning = jaxmd_neighbor_list(
                 positions=sys0.R,
                 cell=sys0.cell,
                 cutoff=state.get('r_cut', 1.0),
-                skin=0.0,
                 capacity_multiplier=1.5,
             )
             neighbors_list = [neighbors0]
             for i in range(1, batch_size):
                 sys_i = System(R=batched_system.R[i], Z=batched_system.Z[i], cell=batched_system.cell[i])
-                nbrs_i = spatial_partitioning.update_fn(sys_i.R, neighbors0, new_cell=sys_i.cell)
+                nbrs_i = spatial_partitioning.neighbor_fn.update(sys_i.R, neighbors0)
                 neighbors_list.append(nbrs_i)
             neighbors_batched = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs, axis=0), *neighbors_list)
             return neighbors_batched

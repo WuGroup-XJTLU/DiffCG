@@ -11,7 +11,6 @@ from typing import Optional, Dict
 from diffcg.md.calculator import CustomEnergyCalculator, init_energy_calculator
 from diffcg.learning.reweighting import ReweightEstimator
 from diffcg.system import trj_atom_to_system, System
-from diffcg.common.neighborlist import neighbor_list
 from diffcg.util.logger import get_logger
 from diffcg.md.sample import MolecularDynamics
 from diffcg.util.math import high_precision_sum

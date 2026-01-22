@@ -16,7 +16,7 @@ from typing import Any
 from ase.calculators.calculator import Calculator
 
 from diffcg.system import System, atoms_to_system
-from diffcg.common.neighborlist import neighbor_list
+from diffcg.common.neighborlist import jaxmd_neighbor_list
 from diffcg.util.logger import get_logger
 
 logger = get_logger(__name__)
@@ -28,7 +28,7 @@ def force(energy_fn: Callable) -> Callable:
 
 
 class CustomCalculator(Calculator):
-    def __init__(self, potentials, calculate_stress=False, capacity_multiplier=1.25, dtype=jnp.float64, cutoff=1.0,skin=0.0):
+    def __init__(self, potentials, calculate_stress=False, capacity_multiplier=1.25, dtype=jnp.float64, cutoff=1.0):
         super().__init__()
 
         if calculate_stress:
@@ -65,7 +65,6 @@ class CustomCalculator(Calculator):
         self.capacity_multiplier = capacity_multiplier
 
         self.cutoff = cutoff
-        self.skin = skin
         self.dtype = dtype
         self.potential_energy = 0.0
 
@@ -87,22 +86,21 @@ class CustomCalculator(Calculator):
         else:
             cell = None
         if self.spatial_partitioning is None:
-            logger.debug("Building neighbor list: cutoff=%s, skin=%s", self.cutoff, self.skin)
-            self.neighbors, self.spatial_partitioning = neighbor_list(positions=R,
+            logger.debug("Building neighbor list: cutoff=%s", self.cutoff)
+            self.neighbors, self.spatial_partitioning = jaxmd_neighbor_list(positions=R,
                                                                       cell=cell,
                                                                       cutoff=self.cutoff,
-                                                                      skin=self.skin,
                                                                       capacity_multiplier=self.capacity_multiplier)
 
-        neighbors = self.spatial_partitioning.update_fn(R, self.neighbors, new_cell=cell)
-        if neighbors.overflow:
+        neighbors = self.spatial_partitioning.neighbor_fn.update(R, self.neighbors)
+        if neighbors.did_buffer_overflow:
             logger.error('Neighbor list overflow detected')
             raise RuntimeError('Spatial overflow.')
         else:
             self.neighbors = neighbors
 
         output = self.calculate_fn(System(R=R, Z=z, cell=cell), neighbors=neighbors)  # note different cell convention
-        
+
         self.results = jax.tree_map(lambda x: np.array(x, dtype=self.dtype), output)
         if jnp.isnan(self.results['energy']):
             logger.error('NaN energy encountered')
@@ -110,7 +108,7 @@ class CustomCalculator(Calculator):
 
 
 class CustomEnergyCalculator(Calculator):
-    def __init__(self, potentials, calculate_stress=False, capacity_multiplier=1.25, dtype=jnp.float64, cutoff=1.0,skin=0.0):
+    def __init__(self, potentials, calculate_stress=False, capacity_multiplier=1.25, dtype=jnp.float64, cutoff=1.0):
         super().__init__()
 
         if calculate_stress:
@@ -146,7 +144,6 @@ class CustomEnergyCalculator(Calculator):
         self.capacity_multiplier = capacity_multiplier
 
         self.cutoff = cutoff
-
         self.dtype = dtype
         self.potential_energy = 0.0
 
@@ -169,14 +166,13 @@ class CustomEnergyCalculator(Calculator):
             cell = None
         if self.spatial_partitioning is None:
             logger.debug("Building neighbor list (energy-only): cutoff=%s", self.cutoff)
-            self.neighbors, self.spatial_partitioning = neighbor_list(positions=R,
+            self.neighbors, self.spatial_partitioning = jaxmd_neighbor_list(positions=R,
                                                                       cell=cell,
                                                                       cutoff=self.cutoff,
-                                                                      skin=0.,
                                                                       capacity_multiplier=self.capacity_multiplier)
 
-        neighbors = self.spatial_partitioning.update_fn(R, self.neighbors,new_cell=cell)
-        if neighbors.overflow:
+        neighbors = self.spatial_partitioning.neighbor_fn.update(R, self.neighbors)
+        if neighbors.did_buffer_overflow:
             logger.error('Neighbor list overflow detected')
             raise RuntimeError('Spatial overflow.')
         else:
@@ -191,11 +187,10 @@ def init_energy_calculator(energy_fn,cutoff=1.0,capacity_multiplier=1.25,dtype=j
         R = system.R
         z = system.Z
         cell = system.cell
-        neighbors, spatial_partitioning = neighbor_list(positions=R,
+        neighbors, spatial_partitioning = jaxmd_neighbor_list(positions=R,
                                                         cell=cell,
                                                         cutoff=cutoff,
-                                                        skin=0.,
                                                         capacity_multiplier=capacity_multiplier)
-        
+
         return energy_fn(system, neighbors,**kwargs)
     return calculate_fn
