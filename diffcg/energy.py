@@ -233,117 +233,183 @@ def _get_edge_list_from_jaxmd_neighbors(neighbors):
 
 
 class TabulatedBondEnergy:
-    def __init__(self, x_vals, y_vals,bonds):
+    def __init__(self, x_vals, y_vals, bonds, bond_types=None):
         self.x_vals = x_vals
-        self.y_vals = y_vals
+        self.y_vals = jnp.atleast_2d(jnp.asarray(y_vals))  # (N_types, N_grid)
         self.bonds = bonds
+        self.bond_types = bond_types
+        self.n_types = self.y_vals.shape[0]
 
     def get_energy_fn(self):
-        spline = custom_interpolate.MonotonicInterpolate(self.x_vals, self.y_vals)
-        tabulated_partial = partial(tabulated, spline=spline)
-      
+        # Create spline for each type
+        splines = [custom_interpolate.MonotonicInterpolate(self.x_vals, self.y_vals[i])
+                   for i in range(self.n_types)]
+
         def energy_fn(system, neighbors, **dynamic_kwargs):
             positions = system.R
             nodes = system.Z
             Ra = positions[self.bonds[:, 0]]
             Rb = positions[self.bonds[:, 1]]
             edges = vmap(partial(displacement, system.cell))(Ra, Rb)
-            dr=vmap(distance)(edges)
-            return high_precision_sum(tabulated_partial(dr))
+            dr = vmap(distance)(edges)
+
+            if self.bond_types is not None:
+                # Evaluate all splines, select by type
+                all_energies = jnp.stack([s(dr) for s in splines])
+                energies = all_energies[self.bond_types, jnp.arange(len(self.bonds))]
+            else:
+                energies = splines[0](dr)
+
+            return high_precision_sum(energies)
         return energy_fn
     
 class HarmonicBondEnergy:
-    def __init__(self,bonds,length=0.45,epsilon=5000):
+    def __init__(self, bonds, length=0.45, epsilon=5000, bond_types=None):
         self.bonds = bonds
-        self.length = length
-        self.epsilon = epsilon
+        self.length = jnp.atleast_1d(jnp.asarray(length))
+        self.epsilon = jnp.atleast_1d(jnp.asarray(epsilon))
+        self.bond_types = bond_types
 
     def get_energy_fn(self):
-      
+
         def energy_fn(system, neighbors, **dynamic_kwargs):
             positions = system.R
             nodes = system.Z
             Ra = positions[self.bonds[:, 0]]
             Rb = positions[self.bonds[:, 1]]
             edges = vmap(partial(displacement, system.cell))(Ra, Rb)
-            dr=vmap(distance)(edges)
-            return high_precision_sum(simple_spring(dr, self.length, self.epsilon))
+            dr = vmap(distance)(edges)
+
+            if self.bond_types is not None:
+                # Per-type: index parameters by type
+                lengths = self.length[self.bond_types]
+                epsilons = self.epsilon[self.bond_types]
+            else:
+                # Backward compatible: broadcast scalar
+                lengths = self.length[0]
+                epsilons = self.epsilon[0]
+
+            return high_precision_sum(simple_spring(dr, lengths, epsilons))
         return energy_fn
     
   
 class TabulatedAngleEnergy:
-    def __init__(self, x_vals, y_vals,angles):
+    def __init__(self, x_vals, y_vals, angles, angle_types=None):
         self.x_vals = x_vals
-        self.y_vals = y_vals
+        self.y_vals = jnp.atleast_2d(jnp.asarray(y_vals))  # (N_types, N_grid)
         self.angles = angles
+        self.angle_types = angle_types
+        self.n_types = self.y_vals.shape[0]
 
     def get_energy_fn(self):
-        spline = custom_interpolate.MonotonicInterpolate(self.x_vals, self.y_vals)
-        tabulated_partial = partial(tabulated, spline=spline)
-      
+        # Create spline for each type
+        splines = [custom_interpolate.MonotonicInterpolate(self.x_vals, self.y_vals[i])
+                   for i in range(self.n_types)]
+
         def energy_fn(system, neighbors, **dynamic_kwargs):
             positions = system.R
             nodes = system.Z
-            R_kj = vmap(partial(displacement, system.cell))(positions[self.angles[:,2]],positions[self.angles[:,1]])
-            R_ij = vmap(partial(displacement, system.cell))(positions[self.angles[:,0]],positions[self.angles[:,1]])
+            R_kj = vmap(partial(displacement, system.cell))(positions[self.angles[:,2]], positions[self.angles[:,1]])
+            R_ij = vmap(partial(displacement, system.cell))(positions[self.angles[:,0]], positions[self.angles[:,1]])
 
             angles = vectorized_angle_fn(R_ij, R_kj)
-            return high_precision_sum(tabulated_partial(angles))
+
+            if self.angle_types is not None:
+                # Evaluate all splines, select by type
+                all_energies = jnp.stack([s(angles) for s in splines])
+                energies = all_energies[self.angle_types, jnp.arange(len(self.angles))]
+            else:
+                energies = splines[0](angles)
+
+            return high_precision_sum(energies)
         return energy_fn
     
 class HarmonicAngleEnergy:
-    def __init__(self,angles,angle_0=1.5,epsilon=50):
+    def __init__(self, angles, angle_0=1.5, epsilon=50, angle_types=None):
         self.angles = angles
-        self.angle_0 = angle_0
-        self.epsilon = epsilon
+        self.angle_0 = jnp.atleast_1d(jnp.asarray(angle_0))
+        self.epsilon = jnp.atleast_1d(jnp.asarray(epsilon))
+        self.angle_types = angle_types
 
     def get_energy_fn(self):
         def energy_fn(system, neighbors, **dynamic_kwargs):
             positions = system.R
             nodes = system.Z
-            R_kj = vmap(partial(displacement, system.cell))(positions[self.angles[:,2]],positions[self.angles[:,1]])
-            R_ij = vmap(partial(displacement, system.cell))(positions[self.angles[:,0]],positions[self.angles[:,1]])
+            R_kj = vmap(partial(displacement, system.cell))(positions[self.angles[:,2]], positions[self.angles[:,1]])
+            R_ij = vmap(partial(displacement, system.cell))(positions[self.angles[:,0]], positions[self.angles[:,1]])
 
             angles = vectorized_angle_fn(R_ij, R_kj)
-            return high_precision_sum(harmonic_angle(angles, self.angle_0, self.epsilon))
+
+            if self.angle_types is not None:
+                # Per-type: index parameters by type
+                angle_0s = self.angle_0[self.angle_types]
+                epsilons = self.epsilon[self.angle_types]
+            else:
+                # Backward compatible: broadcast scalar
+                angle_0s = self.angle_0[0]
+                epsilons = self.epsilon[0]
+
+            return high_precision_sum(harmonic_angle(angles, angle_0s, epsilons))
         return energy_fn
   
 class TabulatedDihedralEnergy:
-    def __init__(self, x_vals, y_vals,dihedrals):
+    def __init__(self, x_vals, y_vals, dihedrals, dihedral_types=None):
         self.x_vals = x_vals
-        self.y_vals = y_vals
+        self.y_vals = jnp.atleast_2d(jnp.asarray(y_vals))  # (N_types, N_grid)
         self.dihedrals = dihedrals
+        self.dihedral_types = dihedral_types
+        self.n_types = self.y_vals.shape[0]
 
     def get_energy_fn(self):
-        spline = custom_interpolate.MonotonicInterpolate(self.x_vals, self.y_vals)
-        tabulated_partial = partial(tabulated, spline=spline)
-      
+        # Create spline for each type
+        splines = [custom_interpolate.MonotonicInterpolate(self.x_vals, self.y_vals[i])
+                   for i in range(self.n_types)]
+
         def energy_fn(system, neighbors, **dynamic_kwargs):
             positions = system.R
             nodes = system.Z
-            R_cd = vmap(partial(displacement, system.cell))(positions[self.dihedrals[:,3]],positions[self.dihedrals[:,2]])
-            R_bc = vmap(partial(displacement, system.cell))(positions[self.dihedrals[:,2]],positions[self.dihedrals[:,1]])
-            R_ab = vmap(partial(displacement, system.cell))(positions[self.dihedrals[:,1]],positions[self.dihedrals[:,0]])
+            R_cd = vmap(partial(displacement, system.cell))(positions[self.dihedrals[:,3]], positions[self.dihedrals[:,2]])
+            R_bc = vmap(partial(displacement, system.cell))(positions[self.dihedrals[:,2]], positions[self.dihedrals[:,1]])
+            R_ab = vmap(partial(displacement, system.cell))(positions[self.dihedrals[:,1]], positions[self.dihedrals[:,0]])
 
             dihedrals = vectorized_dihedral_fn(R_ab, R_bc, R_cd)
-            return high_precision_sum(tabulated_partial(dihedrals))
+
+            if self.dihedral_types is not None:
+                # Evaluate all splines, select by type
+                all_energies = jnp.stack([s(dihedrals) for s in splines])
+                energies = all_energies[self.dihedral_types, jnp.arange(len(self.dihedrals))]
+            else:
+                energies = splines[0](dihedrals)
+
+            return high_precision_sum(energies)
         return energy_fn
     
 class HarmonicDihedralEnergy:
-    def __init__(self,dihedrals,angle_0=1.5,epsilon=50):
+    def __init__(self, dihedrals, angle_0=1.5, epsilon=50, dihedral_types=None):
         self.dihedrals = dihedrals
-        self.angle_0 = angle_0
-        self.epsilon = epsilon
+        self.angle_0 = jnp.atleast_1d(jnp.asarray(angle_0))
+        self.epsilon = jnp.atleast_1d(jnp.asarray(epsilon))
+        self.dihedral_types = dihedral_types
 
     def get_energy_fn(self):
         def energy_fn(system, neighbors, **dynamic_kwargs):
             positions = system.R
             nodes = system.Z
-            R_cd = vmap(partial(displacement, system.cell))(positions[self.dihedrals[:,3]],positions[self.dihedrals[:,2]])
-            R_bc = vmap(partial(displacement, system.cell))(positions[self.dihedrals[:,2]],positions[self.dihedrals[:,1]])
-            R_ab = vmap(partial(displacement, system.cell))(positions[self.dihedrals[:,1]],positions[self.dihedrals[:,0]])
+            R_cd = vmap(partial(displacement, system.cell))(positions[self.dihedrals[:,3]], positions[self.dihedrals[:,2]])
+            R_bc = vmap(partial(displacement, system.cell))(positions[self.dihedrals[:,2]], positions[self.dihedrals[:,1]])
+            R_ab = vmap(partial(displacement, system.cell))(positions[self.dihedrals[:,1]], positions[self.dihedrals[:,0]])
             dihedrals = vectorized_dihedral_fn(R_ab, R_bc, R_cd)
-            return high_precision_sum(harmonic_dihedral(dihedrals, self.angle_0, self.epsilon))
+
+            if self.dihedral_types is not None:
+                # Per-type: index parameters by type
+                angle_0s = self.angle_0[self.dihedral_types]
+                epsilons = self.epsilon[self.dihedral_types]
+            else:
+                # Backward compatible: broadcast scalar
+                angle_0s = self.angle_0[0]
+                epsilons = self.epsilon[0]
+
+            return high_precision_sum(harmonic_dihedral(dihedrals, angle_0s, epsilons))
         return energy_fn
 
 class GenericRepulsionEnergy:
