@@ -134,7 +134,10 @@ class JAXMDSampler:
         # Setup space functions for JAX-MD
         if cell is not None:
             cell_jaxmd = cell.T  # Convert to row-major format
-            self.displacement_fn, self.shift_fn = space.periodic_general(cell_jaxmd)
+            # Use fractional_coordinates=False to keep positions in Cartesian (nm)
+            self.displacement_fn, self.shift_fn = space.periodic_general(
+                cell_jaxmd, fractional_coordinates=False
+            )
             self.box = cell_jaxmd
         else:
             self.displacement_fn, self.shift_fn = space.free()

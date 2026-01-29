@@ -10,7 +10,7 @@ from jax import vmap
 import jax
 from diffcg.util import custom_interpolate
 from diffcg.common.geometry import distance, vectorized_angle_fn, vectorized_dihedral_fn
-from diffcg.common.periodic import displacement
+from diffcg.common.periodic import displacement, make_displacement_with_cached_inverse
 from diffcg.util.math import high_precision_sum
 
 def tabulated(dr: jnp.ndarray, spline: Callable[[jnp.ndarray], jnp.ndarray], **unused_kwargs
@@ -133,79 +133,97 @@ def harmonic_dihedral(angle,
   """
   return epsilon / alpha * (angle - angle_0) ** alpha
 
-def mask_bonded_neighbors(idx, topology, max_num_atoms):
-    """
-    Mask neighbor pairs that are bonded through dihedral interactions.
+def build_bonded_pair_set(topology):
+    """Pre-compute set of bonded atom pairs for O(1) lookup.
 
-    This function identifies pairs of atoms that are bonded through dihedral
+    Extracts all unique pairs of atoms that are bonded through the topology
+    (bonds, angles, or dihedrals) and returns them as a sorted array for
+    efficient lookup via searchsorted.
+
+    Args:
+        topology: (num_entries, n_cols) array where n_cols is 2, 3, or 4
+                  for bonds, angles, or dihedrals respectively.
+
+    Returns:
+        bonded_pairs: (num_pairs, 2) int32 array of sorted (min, max) pairs
+    """
+    n_cols = topology.shape[1]
+    pairs_list = []
+
+    # Extract all pairs within each topology entry
+    for i in range(n_cols):
+        for j in range(i + 1, n_cols):
+            # Stack pairs as (atom_i, atom_j) for each topology row
+            col_i = topology[:, i]
+            col_j = topology[:, j]
+            # Normalize: smaller index first
+            pair_min = jnp.minimum(col_i, col_j)
+            pair_max = jnp.maximum(col_i, col_j)
+            pairs_list.append(jnp.stack([pair_min, pair_max], axis=1))
+
+    # Concatenate all pairs
+    all_pairs = jnp.concatenate(pairs_list, axis=0)
+
+    # Remove duplicates by using unique on a combined key
+    # Encode pairs as single integers for unique operation
+    max_atom = jnp.max(all_pairs) + 1
+    pair_keys = all_pairs[:, 0] * max_atom + all_pairs[:, 1]
+    unique_keys = jnp.unique(pair_keys)
+
+    # Decode back to pairs
+    unique_pairs = jnp.stack([unique_keys // max_atom, unique_keys % max_atom], axis=1)
+    return unique_pairs.astype(jnp.int32)
+
+
+def mask_bonded_neighbors(idx, topology, max_num_atoms, bonded_pairs=None):
+    """
+    Mask neighbor pairs that are bonded through topology interactions.
+
+    This function identifies pairs of atoms that are bonded through topology
     interactions and masks them by setting their indices to max_num_atoms.
     This prevents double-counting of interactions between bonded atoms.
 
     Args:
-        idx (jnp.ndarray): (2, num_pairs) int32 array of neighbor pair indices
-        dihedrals (jnp.ndarray): (num_dihedrals, 4) int32 array of dihedral definitions
+        idx: Tuple of (i_indices, j_indices) for neighbor pairs
+        topology: (num_entries, n_cols) array of topology definitions
         max_num_atoms (int): Maximum number of atoms, used as mask value
+        bonded_pairs: Optional pre-computed bonded pairs from build_bonded_pair_set().
+                      If None, will be computed on-the-fly.
 
     Returns:
-        jnp.ndarray: (2, num_pairs) int32 array with bonded pairs masked
+        Tuple of (i_masked, j_masked) with bonded pairs masked to max_num_atoms
     """
     i = idx[0]  # (num_pairs,) - first atom in each pair
     j = idx[1]  # (num_pairs,) - second atom in each pair
 
-    # For each pair (i, j), check if it is in dihedrals (in either order)
-    def is_bonded(pair_i, pair_j):
-        """
-        Check if two atoms are bonded through any dihedral interaction.
+    # Build bonded pairs if not provided
+    if bonded_pairs is None:
+        bonded_pairs = build_bonded_pair_set(topology)
 
-        Args:
-            pair_i (int): Index of first atom
-            pair_j (int): Index of second atom
+    # Normalize input pairs (smaller index first)
+    pair_min = jnp.minimum(i, j)
+    pair_max = jnp.maximum(i, j)
 
-        Returns:
-            bool: True if atoms are bonded through dihedral
-        """
-        if topology.shape[1]==4:
-            return jnp.any(
-            # Check all possible pairs within dihedrals
-            ((topology[:, 0] == pair_i) & (topology[:, 1] == pair_j)) |
-            ((topology[:, 0] == pair_j) & (topology[:, 1] == pair_i)) |
-            ((topology[:, 0] == pair_i) & (topology[:, 2] == pair_j)) |
-            ((topology[:, 0] == pair_j) & (topology[:, 2] == pair_i)) |
-            ((topology[:, 0] == pair_i) & (topology[:, 3] == pair_j)) |
-            ((topology[:, 0] == pair_j) & (topology[:, 3] == pair_i)) |
-            ((topology[:, 1] == pair_i) & (topology[:, 2] == pair_j)) |
-            ((topology[:, 1] == pair_j) & (topology[:, 2] == pair_i)) |
-            ((topology[:, 1] == pair_i) & (topology[:, 3] == pair_j)) |
-            ((topology[:, 1] == pair_j) & (topology[:, 3] == pair_i)) |
-            ((topology[:, 2] == pair_i) & (topology[:, 3] == pair_j)) |
-            ((topology[:, 2] == pair_j) & (topology[:, 3] == pair_i))
-        )
-        elif topology.shape[1]==3:
-            return jnp.any(
-            # Check all possible pairs within dihedrals
-            ((topology[:, 0] == pair_i) & (topology[:, 1] == pair_j)) |
-            ((topology[:, 0] == pair_j) & (topology[:, 1] == pair_i)) |
-            ((topology[:, 0] == pair_i) & (topology[:, 2] == pair_j)) |
-            ((topology[:, 0] == pair_j) & (topology[:, 2] == pair_i)) |
-            ((topology[:, 1] == pair_i) & (topology[:, 2] == pair_j)) |
-            ((topology[:, 1] == pair_j) & (topology[:, 2] == pair_i)) 
-            )
-        elif topology.shape[1]==2:
-            return jnp.any(
-            ((topology[:, 0] == pair_i) & (topology[:, 1] == pair_j)) |
-            ((topology[:, 0] == pair_j) & (topology[:, 1] == pair_i))
-            )
-        else:
-            raise ValueError(f"Topology shape {topology.shape} not supported")  
-        
-    # Vectorize the bonded check over all pairs
-    v_is_bonded = vmap(is_bonded)
-    bonded_mask = v_is_bonded(i, j)
+    # Encode pairs as single integers for lookup
+    max_atom = jnp.maximum(jnp.max(bonded_pairs) + 1, max_num_atoms + 1)
+    query_keys = pair_min * max_atom + pair_max
+    bonded_keys = bonded_pairs[:, 0] * max_atom + bonded_pairs[:, 1]
+
+    # Sort bonded_keys for searchsorted
+    sorted_indices = jnp.argsort(bonded_keys)
+    sorted_bonded_keys = bonded_keys[sorted_indices]
+
+    # Use searchsorted to find potential matches
+    insert_indices = jnp.searchsorted(sorted_bonded_keys, query_keys)
+
+    # Check if the found index actually matches (handles boundary cases)
+    insert_indices_safe = jnp.minimum(insert_indices, len(sorted_bonded_keys) - 1)
+    bonded_mask = sorted_bonded_keys[insert_indices_safe] == query_keys
 
     # Set both i and j to max_num_atoms if bonded, else keep original
     i_masked = jnp.where(bonded_mask, max_num_atoms, i)
     j_masked = jnp.where(bonded_mask, max_num_atoms, j)
-    return i_masked,j_masked
+    return i_masked, j_masked
 
 
 def _get_edge_list_from_jaxmd_neighbors(neighbors):
@@ -247,22 +265,25 @@ class TabulatedBondEnergy:
 
         def energy_fn(system, neighbors, **dynamic_kwargs):
             positions = system.R
-            nodes = system.Z
+            # Use cached displacement function with pre-computed cell inverse
+            disp_fn = make_displacement_with_cached_inverse(system.cell)
             Ra = positions[self.bonds[:, 0]]
             Rb = positions[self.bonds[:, 1]]
-            edges = vmap(partial(displacement, system.cell))(Ra, Rb)
+            edges = vmap(disp_fn)(Ra, Rb)
             dr = vmap(distance)(edges)
 
             if self.bond_types is not None:
-                # Evaluate all splines, select by type
-                all_energies = jnp.stack([s(dr) for s in splines])
-                energies = all_energies[self.bond_types, jnp.arange(len(self.bonds))]
+                # Use lax.switch to select spline per bond - more efficient for many types
+                def eval_spline(type_idx, d):
+                    branches = [lambda d, s=s: s(d) for s in splines]
+                    return jax.lax.switch(type_idx, branches, d)
+                energies = vmap(eval_spline)(self.bond_types, dr)
             else:
                 energies = splines[0](dr)
 
             return high_precision_sum(energies)
         return energy_fn
-    
+
 class HarmonicBondEnergy:
     def __init__(self, bonds, length=0.45, epsilon=5000, bond_types=None):
         self.bonds = bonds
@@ -274,10 +295,11 @@ class HarmonicBondEnergy:
 
         def energy_fn(system, neighbors, **dynamic_kwargs):
             positions = system.R
-            nodes = system.Z
+            # Use cached displacement function with pre-computed cell inverse
+            disp_fn = make_displacement_with_cached_inverse(system.cell)
             Ra = positions[self.bonds[:, 0]]
             Rb = positions[self.bonds[:, 1]]
-            edges = vmap(partial(displacement, system.cell))(Ra, Rb)
+            edges = vmap(disp_fn)(Ra, Rb)
             dr = vmap(distance)(edges)
 
             if self.bond_types is not None:
@@ -291,8 +313,8 @@ class HarmonicBondEnergy:
 
             return high_precision_sum(simple_spring(dr, lengths, epsilons))
         return energy_fn
-    
-  
+
+
 class TabulatedAngleEnergy:
     def __init__(self, x_vals, y_vals, angles, angle_types=None):
         self.x_vals = x_vals
@@ -308,22 +330,25 @@ class TabulatedAngleEnergy:
 
         def energy_fn(system, neighbors, **dynamic_kwargs):
             positions = system.R
-            nodes = system.Z
-            R_kj = vmap(partial(displacement, system.cell))(positions[self.angles[:,2]], positions[self.angles[:,1]])
-            R_ij = vmap(partial(displacement, system.cell))(positions[self.angles[:,0]], positions[self.angles[:,1]])
+            # Use cached displacement function with pre-computed cell inverse
+            disp_fn = make_displacement_with_cached_inverse(system.cell)
+            R_kj = vmap(disp_fn)(positions[self.angles[:,2]], positions[self.angles[:,1]])
+            R_ij = vmap(disp_fn)(positions[self.angles[:,0]], positions[self.angles[:,1]])
 
             angles = vectorized_angle_fn(R_ij, R_kj)
 
             if self.angle_types is not None:
-                # Evaluate all splines, select by type
-                all_energies = jnp.stack([s(angles) for s in splines])
-                energies = all_energies[self.angle_types, jnp.arange(len(self.angles))]
+                # Use lax.switch to select spline per angle - more efficient for many types
+                def eval_spline(type_idx, a):
+                    branches = [lambda a, s=s: s(a) for s in splines]
+                    return jax.lax.switch(type_idx, branches, a)
+                energies = vmap(eval_spline)(self.angle_types, angles)
             else:
                 energies = splines[0](angles)
 
             return high_precision_sum(energies)
         return energy_fn
-    
+
 class HarmonicAngleEnergy:
     def __init__(self, angles, angle_0=1.5, epsilon=50, angle_types=None):
         self.angles = angles
@@ -334,9 +359,10 @@ class HarmonicAngleEnergy:
     def get_energy_fn(self):
         def energy_fn(system, neighbors, **dynamic_kwargs):
             positions = system.R
-            nodes = system.Z
-            R_kj = vmap(partial(displacement, system.cell))(positions[self.angles[:,2]], positions[self.angles[:,1]])
-            R_ij = vmap(partial(displacement, system.cell))(positions[self.angles[:,0]], positions[self.angles[:,1]])
+            # Use cached displacement function with pre-computed cell inverse
+            disp_fn = make_displacement_with_cached_inverse(system.cell)
+            R_kj = vmap(disp_fn)(positions[self.angles[:,2]], positions[self.angles[:,1]])
+            R_ij = vmap(disp_fn)(positions[self.angles[:,0]], positions[self.angles[:,1]])
 
             angles = vectorized_angle_fn(R_ij, R_kj)
 
@@ -351,7 +377,7 @@ class HarmonicAngleEnergy:
 
             return high_precision_sum(harmonic_angle(angles, angle_0s, epsilons))
         return energy_fn
-  
+
 class TabulatedDihedralEnergy:
     def __init__(self, x_vals, y_vals, dihedrals, dihedral_types=None):
         self.x_vals = x_vals
@@ -367,23 +393,26 @@ class TabulatedDihedralEnergy:
 
         def energy_fn(system, neighbors, **dynamic_kwargs):
             positions = system.R
-            nodes = system.Z
-            R_cd = vmap(partial(displacement, system.cell))(positions[self.dihedrals[:,3]], positions[self.dihedrals[:,2]])
-            R_bc = vmap(partial(displacement, system.cell))(positions[self.dihedrals[:,2]], positions[self.dihedrals[:,1]])
-            R_ab = vmap(partial(displacement, system.cell))(positions[self.dihedrals[:,1]], positions[self.dihedrals[:,0]])
+            # Use cached displacement function with pre-computed cell inverse
+            disp_fn = make_displacement_with_cached_inverse(system.cell)
+            R_cd = vmap(disp_fn)(positions[self.dihedrals[:,3]], positions[self.dihedrals[:,2]])
+            R_bc = vmap(disp_fn)(positions[self.dihedrals[:,2]], positions[self.dihedrals[:,1]])
+            R_ab = vmap(disp_fn)(positions[self.dihedrals[:,1]], positions[self.dihedrals[:,0]])
 
             dihedrals = vectorized_dihedral_fn(R_ab, R_bc, R_cd)
 
             if self.dihedral_types is not None:
-                # Evaluate all splines, select by type
-                all_energies = jnp.stack([s(dihedrals) for s in splines])
-                energies = all_energies[self.dihedral_types, jnp.arange(len(self.dihedrals))]
+                # Use lax.switch to select spline per dihedral - more efficient for many types
+                def eval_spline(type_idx, d):
+                    branches = [lambda d, s=s: s(d) for s in splines]
+                    return jax.lax.switch(type_idx, branches, d)
+                energies = vmap(eval_spline)(self.dihedral_types, dihedrals)
             else:
                 energies = splines[0](dihedrals)
 
             return high_precision_sum(energies)
         return energy_fn
-    
+
 class HarmonicDihedralEnergy:
     def __init__(self, dihedrals, angle_0=1.5, epsilon=50, dihedral_types=None):
         self.dihedrals = dihedrals
@@ -394,10 +423,11 @@ class HarmonicDihedralEnergy:
     def get_energy_fn(self):
         def energy_fn(system, neighbors, **dynamic_kwargs):
             positions = system.R
-            nodes = system.Z
-            R_cd = vmap(partial(displacement, system.cell))(positions[self.dihedrals[:,3]], positions[self.dihedrals[:,2]])
-            R_bc = vmap(partial(displacement, system.cell))(positions[self.dihedrals[:,2]], positions[self.dihedrals[:,1]])
-            R_ab = vmap(partial(displacement, system.cell))(positions[self.dihedrals[:,1]], positions[self.dihedrals[:,0]])
+            # Use cached displacement function with pre-computed cell inverse
+            disp_fn = make_displacement_with_cached_inverse(system.cell)
+            R_cd = vmap(disp_fn)(positions[self.dihedrals[:,3]], positions[self.dihedrals[:,2]])
+            R_bc = vmap(disp_fn)(positions[self.dihedrals[:,2]], positions[self.dihedrals[:,1]])
+            R_ab = vmap(disp_fn)(positions[self.dihedrals[:,1]], positions[self.dihedrals[:,0]])
             dihedrals = vectorized_dihedral_fn(R_ab, R_bc, R_cd)
 
             if self.dihedral_types is not None:
@@ -421,6 +451,10 @@ class GenericRepulsionEnergy:
         self.max_num_atoms = max_num_atoms
         self.r_onset = r_onset
         self.r_cutoff = r_cutoff
+        # Pre-compute bonded pairs for O(n log m) lookup
+        self.bonded_pairs = None
+        if mask_topology is not None:
+            self.bonded_pairs = build_bonded_pair_set(mask_topology)
 
     def get_energy_fn(self):
         if self.mask_topology is None:
@@ -430,9 +464,12 @@ class GenericRepulsionEnergy:
                 # Convert JAX-MD neighbor list to edge list
                 centers, others, N = _get_edge_list_from_jaxmd_neighbors(neighbors)
 
-                edges = vmap(partial(displacement, system.cell))(
-                    positions[centers], positions[others]
-                )
+                # Clamp indices to valid range to prevent OOB access from padding entries
+                safe_others = jnp.minimum(others, N - 1)
+
+                # Use cached displacement function with pre-computed cell inverse
+                disp_fn = make_displacement_with_cached_inverse(system.cell)
+                edges = vmap(disp_fn)(positions[centers], positions[safe_others])
                 dr = vmap(distance)(edges)
 
                 _energy = multiplicative_isotropic_cutoff(generic_repulsion, self.r_onset, self.r_cutoff)(dr, self.sigma, self.epsilon, self.exp)
@@ -443,18 +480,27 @@ class GenericRepulsionEnergy:
 
             return energy_fn
         else:
+            # Capture pre-computed bonded pairs in closure
+            bonded_pairs = self.bonded_pairs
+
             def energy_fn(system, neighbors, **dynamic_kwargs):
                 positions = system.R
 
                 # Convert JAX-MD neighbor list to edge list
                 centers, others, N = _get_edge_list_from_jaxmd_neighbors(neighbors)
 
-                mask_centers, mask_others = mask_bonded_neighbors((centers, others), self.mask_topology, self.max_num_atoms)
+                mask_centers, mask_others = mask_bonded_neighbors(
+                    (centers, others), self.mask_topology, self.max_num_atoms,
+                    bonded_pairs=bonded_pairs
+                )
                 mask = mask_centers < N
 
-                edges = vmap(partial(displacement, system.cell))(
-                    positions[centers], positions[others]
-                )
+                # Clamp indices to valid range to prevent OOB access from padding entries
+                safe_others = jnp.minimum(others, N - 1)
+
+                # Use cached displacement function with pre-computed cell inverse
+                disp_fn = make_displacement_with_cached_inverse(system.cell)
+                edges = vmap(disp_fn)(positions[centers], positions[safe_others])
                 dr = vmap(distance)(edges)
 
                 _energy = multiplicative_isotropic_cutoff(generic_repulsion, self.r_onset, self.r_cutoff)(dr, self.sigma, self.epsilon, self.exp)
@@ -462,7 +508,7 @@ class GenericRepulsionEnergy:
                 return high_precision_sum(out) * 0.5
 
             return energy_fn
-    
+
 
 class TabulatedPairEnergy:
     def __init__(self, x_vals, y_vals,r_onset,r_cutoff,mask_topology=None,max_num_atoms=None):
@@ -472,6 +518,10 @@ class TabulatedPairEnergy:
         self.r_cutoff = r_cutoff
         self.mask_topology = mask_topology
         self.max_num_atoms = max_num_atoms
+        # Pre-compute bonded pairs for O(n log m) lookup
+        self.bonded_pairs = None
+        if mask_topology is not None:
+            self.bonded_pairs = build_bonded_pair_set(mask_topology)
 
     def get_energy_fn(self):
         spline = custom_interpolate.MonotonicInterpolate(self.x_vals, self.y_vals)
@@ -484,9 +534,12 @@ class TabulatedPairEnergy:
                 # Convert JAX-MD neighbor list to edge list
                 centers, others, N = _get_edge_list_from_jaxmd_neighbors(neighbors)
 
-                edges = vmap(partial(displacement, system.cell))(
-                    positions[centers], positions[others]
-                )
+                # Clamp indices to valid range to prevent OOB access from padding entries
+                safe_others = jnp.minimum(others, N - 1)
+
+                # Use cached displacement function with pre-computed cell inverse
+                disp_fn = make_displacement_with_cached_inverse(system.cell)
+                edges = vmap(disp_fn)(positions[centers], positions[safe_others])
                 dr = vmap(distance)(edges)
 
                 truncated_fn = multiplicative_isotropic_cutoff(tabulated_partial, self.r_onset, self.r_cutoff)
@@ -498,18 +551,27 @@ class TabulatedPairEnergy:
 
             return energy_fn
         else:
+            # Capture pre-computed bonded pairs in closure
+            bonded_pairs = self.bonded_pairs
+
             def energy_fn(system, neighbors, **dynamic_kwargs):
                 positions = system.R
 
                 # Convert JAX-MD neighbor list to edge list
                 centers, others, N = _get_edge_list_from_jaxmd_neighbors(neighbors)
 
-                mask_centers, mask_others = mask_bonded_neighbors((centers, others), self.mask_topology, self.max_num_atoms)
+                mask_centers, mask_others = mask_bonded_neighbors(
+                    (centers, others), self.mask_topology, self.max_num_atoms,
+                    bonded_pairs=bonded_pairs
+                )
                 mask = mask_centers < N
 
-                edges = vmap(partial(displacement, system.cell))(
-                    positions[centers], positions[others]
-                )
+                # Clamp indices to valid range to prevent OOB access from padding entries
+                safe_others = jnp.minimum(others, N - 1)
+
+                # Use cached displacement function with pre-computed cell inverse
+                disp_fn = make_displacement_with_cached_inverse(system.cell)
+                edges = vmap(disp_fn)(positions[centers], positions[safe_others])
                 dr = vmap(distance)(edges)
 
                 truncated_fn = multiplicative_isotropic_cutoff(tabulated_partial, self.r_onset, self.r_cutoff)

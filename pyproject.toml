@@ -26,6 +26,8 @@ dependencies = [
   "ase>=3.22",
   "chemfiles>=0.10",
   "optax>=0.1.6",
+  "jax>=0.4",
+  "jax-md>=0.2.7",
 ]
 
 [project.urls]

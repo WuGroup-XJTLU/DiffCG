@@ -97,6 +97,9 @@ class MonotonicInterpolate:
             Returns the interpolated values y_new corresponding to y_new.
         """
 
+        # Clamp inputs to grid range to prevent extrapolation
+        x_new = jnp.clip(x_new, self.x[0], self.x[-1])
+
         a, b, c, d = self.coefficients
 
         x_new_idx = jnp.searchsorted(self.x, x_new, side="right") - 1  # Find the indexes of the reference
@@ -112,7 +115,10 @@ class MonotonicInterpolate:
         d = d[x_new_idx]
 
         x = self.x[x_new_idx]
-        y_new = a * jnp.power(x_new - x, 3) + b * jnp.power(x_new - x, 2) + c * (x_new - x) + d
+        # Use Horner's method: fewer operations, better numerical stability
+        # ((a * dx + b) * dx + c) * dx + d
+        dx = x_new - x
+        y_new = ((a * dx + b) * dx + c) * dx + d
 
         return y_new
 

@@ -1,9 +1,12 @@
 import os
 
-from sympy import false
 # Configure GPU settings
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # Use GPU 0
-os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'  # Disable memory preallocation
+#os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # Use GPU 0
+#os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'  # Disable memory preallocation
+
+# Enable float64 for numerical stability in long MD simulations
+import jax
+jax.config.update("jax_enable_x64", True)
 
 from jax.tree_util import tree_map
 from ase.io import read
@@ -14,16 +17,12 @@ import pandas as pd
 from scipy import interpolate as sci_interpolate
 from ase import units
 
-import sys
-sys.path.append('/home/zhenghaowu/development/diffCG')
-
 from diffcg import energy
 from diffcg.observable.structure import (
     initialize_inter_radial_distribution_fun,
     initialize_angle_distribution_fun,
     initialize_bond_distribution_fun,
     initialize_dihedral_distribution_fun,
-    initialize_radial_distribution_fun,
     InterRDFParams,
     BDFParams,
     ADFParams,
@@ -55,7 +54,7 @@ import os
 Temperature = 600
 
 
-DATASET_ROOT = "/home/zhenghaowu/development/diffCG/examples/test_gradCG_polystyrene/datasets"
+DATASET_ROOT = os.path.join(os.path.dirname(os.path.dirname(__file__)), "test_data/test_gradCG_polystyrene/datasets")
 
 
 def _load_curve_csv(path: str, x_grid: np.ndarray, zero_eps: float = 1e-7):
@@ -193,7 +192,8 @@ def build_energy_fn_with_params(params, max_num_atoms=1):
     return energy_fn
 
 
-pretrained_params = np.load('pretrained_params.npy', allow_pickle=True).item()
+pretrained_params_path = os.path.join(os.path.dirname(__file__), 'pretrained_params.npy')
+pretrained_params = np.load(pretrained_params_path, allow_pickle=True).item()
 
 quantity_dict = {}
 if 'rdf' in target_dict:
@@ -240,9 +240,7 @@ def calculate_observables(traj_file='sample.traj'):
 
 loss_fn = init_independent_mse_loss_fn(quantity_dict)
 
-lammpsdata_file = (
-    '/home/zhenghaowu/development/diffCG/examples/test_gradCG_polystyrene/datasets/T600/PS.data'
-)
+lammpsdata_file = os.path.join(DATASET_ROOT, f"T{Temperature}", "PS.data")
 sys_data = read_lammps_data(lammpsdata_file)
 # Mapping of atom types
 atom_types_mapping = {0: 'C', 1: 'C', 2: 'H'}
@@ -270,7 +268,7 @@ optimizer = optax.chain(
 sim_time_scheme = {'production_steps': 6 * 1000, 'equilibration_steps': 1000}
 sampler_params = {
     'ensemble': "nvt",
-    'thermostat': "berendsen",
+    'thermostat': "langevin",
     'temperature': Temperature,
     'starting_temperature': Temperature,
     'timestep': 4,

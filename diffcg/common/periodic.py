@@ -26,6 +26,11 @@ def _to_frac(cell, R):
     return jnp.einsum("Aa,a->A", inverse(cell), R)
 
 
+def _to_frac_with_inv(cell_inv, R):
+    """Convert to fractional coords using pre-computed cell inverse."""
+    return jnp.einsum("Aa,a->A", cell_inv, R)
+
+
 def to_frac(cell, R):
     return vmap(partial(_to_frac, cell))(R)
 
@@ -40,6 +45,34 @@ def from_frac(cell, X):
 
 def make_displacement(cell):
     return partial(displacement, cell)
+
+
+def make_displacement_with_cached_inverse(cell):
+    """Create displacement function with pre-computed cell inverse.
+
+    This is more efficient than make_displacement when the cell doesn't change
+    and displacement is called many times.
+
+    Args:
+        cell: (D, D) cell matrix or None for non-periodic
+
+    Returns:
+        displacement_fn(Ra, Rb) -> displacement vector
+    """
+    if cell is None:
+        def displacement_fast(Ra, Rb):
+            return Rb - Ra
+        return displacement_fast
+
+    cell_inv = jnp.linalg.inv(cell)
+
+    def displacement_fast(Ra, Rb):
+        R = Rb - Ra
+        X = _to_frac_with_inv(cell_inv, R)
+        X = jnp.mod(X + cast(0.5), cast(1.0)) - cast(0.5)
+        return _from_frac(cell, X)
+
+    return displacement_fast
 
 
 def displacement(cell, Ra, Rb):

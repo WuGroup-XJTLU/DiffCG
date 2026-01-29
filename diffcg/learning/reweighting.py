@@ -19,6 +19,33 @@ logger = get_logger(__name__)
 # Numerical stability small constant
 EPS: float = 1e-10
 
+
+@jax.jit
+def _estimate_effective_samples_jit(weights: jnp.ndarray) -> jnp.ndarray:
+    """JIT-compiled effective sample size estimation."""
+    safe_w = jnp.where(weights > EPS, weights, EPS)
+    exponent = -jnp.sum(safe_w * jnp.log(safe_w))
+    return jnp.exp(exponent)
+
+
+@jax.jit
+def _compute_weights_jit(
+    energies_new: jnp.ndarray,
+    ref_energies: jnp.ndarray,
+    base_energies: jnp.ndarray,
+    pv: jnp.ndarray,
+    beta: float,
+) -> jnp.ndarray:
+    """JIT-compiled weight computation."""
+    unew = energies_new + base_energies + pv
+    uref = ref_energies + pv
+    log_weights = -(unew - uref) * beta
+    log_weights = log_weights - log_weights.max()
+    prob_ratios = jnp.exp(log_weights)
+    weights = prob_ratios / high_precision_sum(prob_ratios)
+    return weights
+
+
 class ReweightEstimator:
     """Estimator for reweighting factors and effective sample size.
 
@@ -51,9 +78,7 @@ class ReweightEstimator:
 
         Uses exp(-sum w_i log w_i) with clipping to avoid log(0).
         """
-        safe_w = jnp.where(weights > EPS, weights, EPS)
-        exponent = -jnp.sum(safe_w * jnp.log(safe_w))
-        return jnp.exp(exponent)
+        return _estimate_effective_samples_jit(weights)
 
     def estimate_weight(self, energies_new: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """Return normalized weights and n_eff for new energies.
@@ -66,13 +91,10 @@ class ReweightEstimator:
             weights: Normalized importance weights per frame
             n_eff: Effective number of samples implied by the weights
         """
-        unew = energies_new + self.base_energies + self.pv
-        uref = self.ref_energies + self.pv
-        exponent = (unew - uref) * self.beta
-        exponent = exponent - exponent.max()
-        prob_ratios = jnp.exp(-exponent)
-        weights = prob_ratios / high_precision_sum(prob_ratios)
-        n_eff = self.estimate_effective_samples(weights)
+        weights = _compute_weights_jit(
+            energies_new, self.ref_energies, self.base_energies, self.pv, self.beta
+        )
+        n_eff = _estimate_effective_samples_jit(weights)
         return weights, n_eff
 
     # Backward-compatibility alias used elsewhere in the codebase

@@ -3,13 +3,14 @@
 
 import jax.numpy as jnp
 from jax import jit, grad, vmap, lax, jacrev, jacfwd, ops
+from jax.scipy.integrate import trapezoid
 from functools import partial
 from jax.scipy.stats.norm import cdf as normal_cdf
 import numpy as np
 import dataclasses
 from diffcg.util.math import high_precision_sum
 from diffcg.common.geometry import angle, dihedral, vectorized_angle_fn, vectorized_dihedral_fn, distance
-from diffcg.common.periodic import displacement
+from diffcg.common.periodic import displacement, make_displacement_with_cached_inverse
 
 def box_volume(box, ndim):
     """Computes the volume of the simulation box"""
@@ -139,19 +140,25 @@ def initialize_bond_distribution_fun(bdf_params):
     """
     _, bdf_bin_centers, bdf_bin_boundaries, sigma, bond_top = dataclasses.astuple(bdf_params)
     bin_size = jnp.diff(bdf_bin_boundaries)
+    # Pre-compute Gaussian normalization constant
+    gaussian_norm = bin_size / jnp.sqrt(2 * jnp.pi * sigma ** 2)
+    sigma_sq_2 = 2 * sigma ** 2  # Pre-compute 2*sigma^2
 
     def bond_corr_fun(system, **dynamic_kwargs):
         # computes instantaneous pair correlation function ensuring each particle pair contributes exactly 1
         positions = system.R
         Ra = positions[bond_top[:,0],:]
         Rb = positions[bond_top[:,1],:]
-        edges = vmap(partial(displacement, system.cell))(Ra, Rb)
+        # Use cached displacement function with pre-computed cell inverse
+        disp_fn = make_displacement_with_cached_inverse(system.cell)
+        edges = vmap(disp_fn)(Ra, Rb)
         dr=vmap(distance)(edges)
         #  Gaussian distribution ensures that discrete integral over distribution is 1
-        exp = jnp.exp(-0.5 * (dr[:, jnp.newaxis] - bdf_bin_centers) ** 2 / sigma ** 2)  # Gaussian exponent
-        gaussian_distances = exp * bin_size / jnp.sqrt(2 * jnp.pi * sigma ** 2)
+        exp = jnp.exp(-(dr[:, jnp.newaxis] - bdf_bin_centers) ** 2 / sigma_sq_2)  # Gaussian exponent
+        gaussian_distances = exp * gaussian_norm
         bond_corr = high_precision_sum(gaussian_distances, axis=0)  # sum over all neighbors
-        mean_bond_corr = bond_corr / jnp.trapz(bond_corr, bdf_bin_centers)
+        integral = trapezoid(bond_corr, bdf_bin_centers)
+        mean_bond_corr = bond_corr / jnp.where(jnp.abs(integral) < 1e-10, 1.0, integral)
         return mean_bond_corr
 
     def bdf_compute_fun(system, **unused_kwargs):
@@ -225,26 +232,40 @@ def initialize_inter_radial_distribution_fun(inter_rdf_params):
     """
     _, rdf_bin_centers, rdf_bin_boundaries, sigma, exclude_mask = dataclasses.astuple(inter_rdf_params)
     bin_size = jnp.diff(rdf_bin_boundaries)
+    # Pre-compute Gaussian normalization constant
+    gaussian_norm = bin_size / jnp.sqrt(2 * jnp.pi * sigma ** 2)
+    sigma_sq_2 = 2 * sigma ** 2  # Pre-compute 2*sigma^2
+    # Pre-compute combined exclusion mask (self-pairs + user-specified exclusions)
+    n_particles = exclude_mask.shape[0]
+    combined_mask = (1.0 - jnp.eye(n_particles)) * exclude_mask
 
     def pair_corr_fun(system, **dynamic_kwargs):
         # computes instantaneous pair correlation function ensuring each particle pair contributes exactly 1
         positions = system.R
-        n_particles = positions.shape[0]
 
-        # Compute all pairwise displacement vectors
-        disp_fn = partial(displacement, system.cell)
-        # (N, N, D)
-        disp_matrix = vmap(lambda x: vmap(lambda y: disp_fn(x, y))(positions))(positions)
-        # Compute all pairwise distances (N, N)
-        dr = vmap(lambda row: vmap(distance)(row))(disp_matrix)
+        # Vectorized pairwise distance computation using broadcasting
+        # diff[i,j] = positions[j] - positions[i], shape (N, N, D)
+        diff = positions[jnp.newaxis, :, :] - positions[:, jnp.newaxis, :]
 
-        # Exclude self-pairs and pairs to be masked
-        mask = (1.0 - jnp.eye(n_particles)) * exclude_mask  # 0 for self, 1 for valid pairs, 0 for excluded
-        dr = dr * mask + (1.0 - mask) * 1e7  # set excluded/self pairs to large value
+        # Apply periodic boundary conditions if cell exists
+        if system.cell is not None:
+            cell_inv = jnp.linalg.inv(system.cell)
+            # Convert to fractional coordinates
+            frac = jnp.einsum('Aa,ija->ijA', cell_inv, diff)
+            # Apply minimum image convention
+            frac = jnp.mod(frac + 0.5, 1.0) - 0.5
+            # Convert back to Cartesian
+            diff = jnp.einsum('aA,ijA->ija', system.cell, frac)
+
+        # Compute distances using vectorized norm
+        dr = jnp.sqrt(jnp.sum(diff**2, axis=-1) + 1e-16)  # (N, N) with small eps for gradient safety
+
+        # Apply pre-computed exclusion mask
+        dr = dr * combined_mask + (1.0 - combined_mask) * 1e7  # set excluded/self pairs to large value
 
         # Gaussian distribution ensures that discrete integral over distribution is 1
-        exp = jnp.exp(-0.5 * (dr[:, :, jnp.newaxis] - rdf_bin_centers) ** 2 / sigma ** 2)  # Gaussian exponent
-        gaussian_distances = exp * bin_size / jnp.sqrt(2 * jnp.pi * sigma ** 2)
+        exp = jnp.exp(-(dr[:, :, jnp.newaxis] - rdf_bin_centers) ** 2 / sigma_sq_2)  # Gaussian exponent
+        gaussian_distances = exp * gaussian_norm
         pair_corr_per_particle = high_precision_sum(gaussian_distances, axis=1)  # sum over all neighbors
         mean_pair_corr = high_precision_sum(pair_corr_per_particle, axis=0) / n_particles
         return mean_pair_corr
@@ -333,19 +354,25 @@ def initialize_angle_distribution_fun( adf_params):
     """
     _, adf_bin_centers, adf_bin_boundaries, sigma_theta, angle_top = dataclasses.astuple(adf_params)
     bin_size = jnp.diff(adf_bin_boundaries)
+    # Pre-compute Gaussian normalization constant
+    gaussian_norm = bin_size / jnp.sqrt(2 * jnp.pi * sigma_theta ** 2)
+    sigma_sq_2 = 2 * sigma_theta ** 2  # Pre-compute 2*sigma^2
 
     def angle_corr_fun(system):
         """Compute adf contribution of each triplet."""
         positions = system.R
-        R_kj = vmap(partial(displacement, system.cell))(positions[angle_top[:,2]],positions[angle_top[:,1]])
-        R_ij = vmap(partial(displacement, system.cell))(positions[angle_top[:,0]],positions[angle_top[:,1]])
+        # Use cached displacement function with pre-computed cell inverse
+        disp_fn = make_displacement_with_cached_inverse(system.cell)
+        R_kj = vmap(disp_fn)(positions[angle_top[:,2]],positions[angle_top[:,1]])
+        R_ij = vmap(disp_fn)(positions[angle_top[:,0]],positions[angle_top[:,1]])
 
         angles = vectorized_angle_fn(R_ij, R_kj)
-        
-        exponent = jnp.exp(-0.5 * (angles[:, jnp.newaxis] - adf_bin_centers) ** 2 / sigma_theta ** 2)
-        gaussians = exponent * bin_size / jnp.sqrt(2 * jnp.pi * sigma_theta ** 2)
+
+        exponent = jnp.exp(-(angles[:, jnp.newaxis] - adf_bin_centers) ** 2 / sigma_sq_2)
+        gaussians = exponent * gaussian_norm
         unnormed_adf = high_precision_sum(gaussians, axis=0)
-        adf = unnormed_adf / jnp.trapz(unnormed_adf, adf_bin_centers)
+        integral = trapezoid(unnormed_adf, adf_bin_centers)
+        adf = unnormed_adf / jnp.where(jnp.abs(integral) < 1e-10, 1.0, integral)
         return adf
 
     def adf_fn(system, **unused_kwargs):
@@ -418,21 +445,27 @@ def initialize_dihedral_distribution_fun(ddf_params):
     """
     _, ddf_bin_centers, ddf_bin_boundaries, sigma_theta, angle_top = dataclasses.astuple(ddf_params)
     bin_size = jnp.diff(ddf_bin_boundaries)
+    # Pre-compute Gaussian normalization constant
+    gaussian_norm = bin_size / jnp.sqrt(2 * jnp.pi * sigma_theta ** 2)
+    sigma_sq_2 = 2 * sigma_theta ** 2  # Pre-compute 2*sigma^2
 
     def dihedral_corr_fun(system):
         """Compute adf contribution of each triplet."""
 
         positions = system.R
-        R_cd = vmap(partial(displacement, system.cell))(positions[angle_top[:,3]],positions[angle_top[:,2]])
-        R_bc = vmap(partial(displacement, system.cell))(positions[angle_top[:,2]],positions[angle_top[:,1]])
-        R_ab = vmap(partial(displacement, system.cell))(positions[angle_top[:,1]],positions[angle_top[:,0]])
+        # Use cached displacement function with pre-computed cell inverse
+        disp_fn = make_displacement_with_cached_inverse(system.cell)
+        R_cd = vmap(disp_fn)(positions[angle_top[:,3]],positions[angle_top[:,2]])
+        R_bc = vmap(disp_fn)(positions[angle_top[:,2]],positions[angle_top[:,1]])
+        R_ab = vmap(disp_fn)(positions[angle_top[:,1]],positions[angle_top[:,0]])
 
         dihedrals = vectorized_dihedral_fn(R_ab, R_bc, R_cd)
-        
-        exponent = jnp.exp(-0.5 * (dihedrals[:, jnp.newaxis] - ddf_bin_centers) ** 2 / sigma_theta ** 2)
-        gaussians = exponent * bin_size / jnp.sqrt(2 * jnp.pi * sigma_theta ** 2)
+
+        exponent = jnp.exp(-(dihedrals[:, jnp.newaxis] - ddf_bin_centers) ** 2 / sigma_sq_2)
+        gaussians = exponent * gaussian_norm
         unnormed_ddf = high_precision_sum(gaussians, axis=0)
-        ddf = unnormed_ddf / jnp.trapz(unnormed_ddf, ddf_bin_centers)
+        integral = trapezoid(unnormed_ddf, ddf_bin_centers)
+        ddf = unnormed_ddf / jnp.where(jnp.abs(integral) < 1e-10, 1.0, integral)
         return ddf
 
     def ddf_fn(system, **unused_kwargs):
