@@ -9,20 +9,22 @@ from typing import Callable, Dict, Optional, Tuple, Any
 import numpy as np
 import jax.numpy as jnp
 
-from ase import units
-
 from diffcg import energy as energy_mod
-# CustomCalculator removed - MD now uses energy_fn directly
-from diffcg.md.sample import MolecularDynamics
-from diffcg.observable.analyze import analyze
+from diffcg.system import AtomicSystem, Trajectory
+from diffcg.md.sample import MolecularDynamics, create_equilibration_run, create_production_run
+from diffcg.observable.analyze import TrajectoryAnalyzer
 from diffcg.observable.structure import (
     initialize_inter_radial_distribution_fun,
     initialize_bond_distribution_fun,
     initialize_angle_distribution_fun,
     initialize_dihedral_distribution_fun,
 )
-from diffcg.io.ase_trj import read_ase_trj
-from diffcg.util.boltzmann_inversion import boltzmann_inversion
+from diffcg._core.boltzmann import boltzmann_inversion
+
+# DiffCG energy functions already output kJ/mol; this constant converts
+# to ASE internal eV units. Since DiffCG uses kJ/mol throughout, we apply
+# the same factor that was previously ase.units.kJ / ase.units.mol.
+_KJ_PER_MOL_TO_EV = 0.01036427230133138  # kJ/mol -> eV
 
 
 # Small numerical stabilizer for logs and divisions
@@ -103,7 +105,8 @@ class IterativeBoltzmannInversion:
         self,
         *,
         kBT: float,
-        init_atoms,
+        init_atoms=None,
+        system: Optional[AtomicSystem] = None,
         targets: IBITargets,
         config: IBIConfig,
         mask_topology: Optional[jnp.ndarray] = None,
@@ -111,7 +114,19 @@ class IterativeBoltzmannInversion:
         initial_tables: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.kBT = float(kBT)
-        self.atoms = init_atoms
+
+        # Accept either system (AtomicSystem) or init_atoms (backward compat)
+        if system is not None:
+            self.system = system
+        elif init_atoms is not None:
+            if isinstance(init_atoms, AtomicSystem):
+                self.system = init_atoms
+            else:
+                from diffcg.system import from_ase_atoms
+                self.system = from_ase_atoms(init_atoms)
+        else:
+            raise ValueError("Either 'system' or 'init_atoms' must be provided")
+
         self.targets = targets
         self.cfg = config
         self.mask_topology = mask_topology
@@ -248,8 +263,8 @@ class IterativeBoltzmannInversion:
             total = 0.0
             for fn in energy_fns:
                 total = total + fn(system, neighbors, **dynamic_kwargs)
-            # Convert to ASE expected units
-            return total * units.kJ / units.mol
+            # Convert to ASE expected units (kept for backward compat with energy pipeline)
+            return total * _KJ_PER_MOL_TO_EV
 
         return sum_energy
 
@@ -262,43 +277,17 @@ class IterativeBoltzmannInversion:
         return jnp.array(U_np)
 
     # MD helpers
-    def _create_md_equ(self, step: int, init_atoms, energy_fn: Callable):
-        params = self.cfg.sampler_params
-
-        md_equ = MolecularDynamics(
-            init_atoms,
-            energy_fn=energy_fn,
-            ensemble=params["ensemble"],
-            thermostat=params["thermostat"],
-            temperature=params["temperature"],
-            starting_temperature=params.get("starting_temperature", params["temperature"]),
-            timestep=params["timestep"],
-            cutoff=self.cfg.r_cut,
-            friction=params.get("friction", 1.0),
-            trajectory=None,
-            logfile=None,
-            loginterval=1,
+    def _create_md_equ(self, step: int, start_system: AtomicSystem, energy_fn: Callable):
+        return create_equilibration_run(
+            start_system, energy_fn, self.cfg.sampler_params, self.cfg.r_cut,
         )
-        return md_equ
 
-    def _create_md_prd(self, step: int, init_atoms, energy_fn: Callable):
-        params = self.cfg.sampler_params
-
-        md_prod = MolecularDynamics(
-            init_atoms,
-            energy_fn=energy_fn,
-            ensemble=params["ensemble"],
-            thermostat=params["thermostat"],
-            temperature=params["temperature"],
-            starting_temperature=params.get("starting_temperature", params["temperature"]),
-            timestep=params["timestep"],
-            cutoff=self.cfg.r_cut,
-            friction=params.get("friction", 1.0),
+    def _create_md_prd(self, step: int, start_system: AtomicSystem, energy_fn: Callable):
+        return create_production_run(
+            start_system, energy_fn, self.cfg.sampler_params, self.cfg.r_cut,
             trajectory=f"{self.cfg.trajectory_prefix}{step}.traj",
             logfile=f"{self.cfg.logfile_prefix}{step}.log",
-            loginterval=params.get("loginterval", 100),
         )
-        return md_prod
 
     # Observables
     def _build_quantity_fns(self) -> Dict[str, Dict[str, Any]]:
@@ -322,29 +311,13 @@ class IterativeBoltzmannInversion:
 
         return quantity
 
-    def _compute_observables(self, traj_path: str) -> Dict[str, jnp.ndarray]:
-        systems = read_ase_trj(traj_path)
-        # Build analyzers per quantity
+    def _compute_observables(self, traj: Trajectory) -> Dict[str, jnp.ndarray]:
+        batched_systems = traj.to_batched_system()
         quantities = self._build_quantity_fns()
         obs: Dict[str, jnp.ndarray] = {}
         for name, q in quantities.items():
-            analyzer = analyze(q["compute_fn"], self.atoms)
-            series = analyzer.analyze(
-                # stack batched systems via tree_map inside analyze
-                # analyze class handles batching internally with lax.scan.
-                # We just pass the stacked systems produced by read_ase_trj
-                # read_ase_trj already returns list of System; analyze expects batched structure.
-                # The analyze implementation converts inside using tree_map.
-                # So pass as-is: a tuple/list of Systems.
-                # To avoid confusion, we rely on analyze to read from Systems.
-                # Here we pass a small wrapper that matches expected structure.
-                # However, analyze requires a batched System (stacked). Reuse its internal batching.
-                # We can safely pass the list by constructing a simple container.
-                # The analyze class, as implemented, expects a batched System (tree stacked) not list.
-                # Convert to batched here:
-                _stack_systems(systems)
-            )
-            # Average across frames
+            analyzer = TrajectoryAnalyzer(q["compute_fn"], self.system)
+            series = analyzer.analyze(batched_systems)
             obs[name] = jnp.mean(series, axis=0)
         return obs
 
@@ -361,13 +334,13 @@ class IterativeBoltzmannInversion:
         energy_fn = self._build_energy_fn()
         scheme = self.cfg.sim_time_scheme
 
-        md_equ = self._create_md_equ(step_idx, self.atoms, energy_fn)
+        md_equ = self._create_md_equ(step_idx, self.system, energy_fn)
         md_equ.run(scheme["equilibration_steps"])
-        md_prod = self._create_md_prd(step_idx, md_equ.atoms, energy_fn)
+        md_prod = self._create_md_prd(step_idx, md_equ.get_final_system(), energy_fn)
         md_prod.run(scheme["production_steps"])
 
-        traj_path = f"{self.cfg.trajectory_prefix}{step_idx}.traj"
-        observables = self._compute_observables(traj_path)
+        traj = md_prod.get_trajectory()
+        observables = self._compute_observables(traj)
 
         diagnostics: Dict[str, Any] = {"rmse": {}}
 
@@ -455,10 +428,5 @@ class IterativeBoltzmannInversion:
         }
 
 
-# Utility to stack a list of System objects into a batched System tree
-def _stack_systems(systems):
-    # Defer import to avoid cycles
-    from jax.tree_util import tree_map
-    return tree_map(lambda *xs: jnp.stack(xs), *systems)
 
 

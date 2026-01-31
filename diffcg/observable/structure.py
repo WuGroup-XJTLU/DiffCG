@@ -2,15 +2,15 @@
 # Copyright (c) 2025 WuResearchGroup
 
 import jax.numpy as jnp
-from jax import jit, grad, vmap, lax, jacrev, jacfwd, ops
+from jax import jit, grad, vmap, lax
 from jax.scipy.integrate import trapezoid
 from functools import partial
 from jax.scipy.stats.norm import cdf as normal_cdf
 import numpy as np
 import dataclasses
-from diffcg.util.math import high_precision_sum
-from diffcg.common.geometry import angle, dihedral, vectorized_angle_fn, vectorized_dihedral_fn, distance
-from diffcg.common.periodic import displacement, make_displacement_with_cached_inverse
+from diffcg._core.math import high_precision_sum
+from diffcg._core.geometry import angle, dihedral, vectorized_angle_fn, vectorized_dihedral_fn, distance
+from diffcg._core.periodic import make_displacement_with_cached_inverse
 
 def box_volume(box, ndim):
     """Computes the volume of the simulation box"""
@@ -285,7 +285,10 @@ def initialize_inter_radial_distribution_fun(inter_rdf_params):
         n_particles = R.shape[0]
         total_vol = box_volume(system.cell, system.R.shape[1])  # volume of partition
         mean_pair_corr = pair_corr_fun(system)
-        particle_density = n_particles / total_vol
+        # Use effective neighbor count to account for excluded pairs,
+        # ensuring g(r) → 1.0 at large r
+        n_effective_neighbors = jnp.sum(combined_mask) / n_particles
+        particle_density = n_effective_neighbors / total_vol
         rdf = mean_pair_corr / norming_factors(particle_density, rdf_bin_boundaries)
         return rdf
     return rdf_compute_fun

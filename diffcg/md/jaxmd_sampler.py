@@ -17,19 +17,20 @@ from jax import random
 from jax_md import simulate, space, partition
 
 from diffcg.system import System
-from diffcg.common.neighborlist import jaxmd_neighbor_list, JAXMDSpatialPartitioning
-from diffcg.util.logger import get_logger
+from diffcg._core.neighborlist import jaxmd_neighbor_list, JAXMDSpatialPartitioning
+from diffcg._core.logger import get_logger
+from diffcg._core.constants import BOLTZMANN_KJMOLK
 
 logger = get_logger(__name__)
 
-# Boltzmann constant in kJ/(mol*K)
-KB_KJ_MOL = 0.0083145107
+# Keep module-level alias for backward compat in tests
+KB_KJ_MOL = BOLTZMANN_KJMOLK
 
-# Conversion factor from fs to JAX-MD internal time units
-# JAX-MD uses reduced units, but we'll keep consistent with DiffCG's conventions
-# The length scale is in nm, time unit is sqrt(u*nm^2/(kJ/mol)) ~ 0.1 ps
-# 1 fs = 0.001 ps, so we multiply by 0.1 to convert fs to internal units
-FS_TO_INTERNAL = 0.1
+# Time unit conversion factor
+# DiffCG uses kJ/mol (energy), nm (length). For F=ma consistency with mass
+# in g/mol (u), the internal time unit must be picoseconds (ps).
+# User inputs are in femtoseconds (fs), so we convert fs -> ps.
+FS_TO_INTERNAL = 0.001
 
 # Result container for MD simulation
 MDResult = namedtuple("MDResult", ("final_state", "trajectory", "final_neighbors"))
@@ -81,7 +82,7 @@ class JAXMDSampler:
         timestep: float = 2.0,
         kT: Optional[float] = None,
         capacity_multiplier: float = 1.25,
-        pressure: float = 1.01325e-4,
+        pressure: float = 1.01325,
         taut: Optional[float] = None,
         taup: Optional[float] = None,
         friction: float = 1.0,
@@ -101,7 +102,7 @@ class JAXMDSampler:
             timestep: Time step in fs.
             kT: Thermal energy in kJ/mol. If None, computed from temperature.
             capacity_multiplier: Neighbor list capacity multiplier.
-            pressure: External pressure in GPa (for NPT).
+            pressure: External pressure in bar (for NPT). Default is 1.01325 bar (1 atm).
             taut: Temperature coupling time constant in fs (for Nose-Hoover).
             taup: Pressure coupling time constant in fs (for NPT Nose-Hoover).
             friction: Friction coefficient in 1/ps (for Langevin).
@@ -143,6 +144,12 @@ class JAXMDSampler:
             self.displacement_fn, self.shift_fn = space.free()
             self.box = None
 
+        # Store mass (in g/mol = u, consistent with kJ/mol + nm + ps unit system)
+        if mass is not None:
+            self.mass = jnp.array(mass, dtype=jnp.float32)
+        else:
+            self.mass = jnp.float32(1.0)
+
         # Store original energy function and create wrapped version
         self._original_energy_fn = energy_fn
         self._wrapped_energy_fn = _wrap_energy_fn_for_jaxmd(energy_fn, Z, cell)
@@ -153,13 +160,13 @@ class JAXMDSampler:
             box=self.box,
             r_cutoff=cutoff,
             capacity_multiplier=capacity_multiplier,
-            format=partition.Sparse,
+            format=partition.Dense,  # Fixed: was Sparse, but _get_edge_list_from_jaxmd_neighbors expects Dense format
         )
 
         # Select and create integrator
         self._create_integrator(dt, friction, pressure, mass)
 
-        logger.info(
+        logger.debug(
             "Created JAX-MD sampler: ensemble=%s, thermostat=%s, T=%s K, dt=%s fs",
             self.ensemble, self.thermostat if self.ensemble == 'nvt' else 'n/a',
             temperature, timestep
@@ -194,8 +201,9 @@ class JAXMDSampler:
 
         elif self.ensemble == 'nvt':
             if self.thermostat == 'langevin':
-                # Friction is in 1/ps, convert to internal units
-                gamma = friction * 0.1  # Convert from 1/ps to internal units
+                # Friction coefficient in 1/ps (no conversion needed for JAX-MD)
+                # JAX-MD expects gamma in 1/ps even though timestep dt is in fs
+                gamma = friction
                 self.init_fn, self.apply_fn = simulate.nvt_langevin(
                     energy_fn_with_neighbors,
                     self.shift_fn,
@@ -223,11 +231,10 @@ class JAXMDSampler:
 
         elif self.ensemble == 'npt':
             # NPT only supports Nose-Hoover in JAX-MD
-            # Convert pressure from GPa to internal units (kJ/(mol*nm^3))
-            # 1 GPa = 1e9 Pa = 1e9 J/m^3 = 1e9 * 1e-3 kJ / (1e27 nm^3) = 1e-21 kJ/nm^3
-            # But JAX-MD uses reduced units, so we need to be careful
-            # For now, assume pressure is already in appropriate units
-            pressure_internal = pressure  # User should provide in correct units
+            # Convert pressure from bar to internal units (kJ/(mol*nm^3))
+            # 1 bar = 0.0602214 kJ/(mol*nm^3)
+            # Using inverse conversion: 1 kJ/(mol*nm^3) = 16.6054 bar
+            pressure_internal = pressure / 16.6054  # bar to kJ/(mol*nm^3)
 
             self.init_fn, self.apply_fn = simulate.npt_nose_hoover(
                 energy_fn_with_neighbors,
@@ -268,7 +275,7 @@ class JAXMDSampler:
         if neighbor is None:
             neighbor = self.neighbor_fn.allocate(R)
 
-        state = self.init_fn(key, R, neighbor=neighbor)
+        state = self.init_fn(key, R, mass=self.mass, neighbor=neighbor)
         return state, neighbor
 
     def step(

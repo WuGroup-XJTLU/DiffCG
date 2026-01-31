@@ -8,10 +8,10 @@ import jax.numpy as jnp
 from functools import partial,wraps
 from jax import vmap
 import jax
-from diffcg.util import custom_interpolate
-from diffcg.common.geometry import distance, vectorized_angle_fn, vectorized_dihedral_fn
-from diffcg.common.periodic import displacement, make_displacement_with_cached_inverse
-from diffcg.util.math import high_precision_sum
+from diffcg._core import interpolate as custom_interpolate
+from diffcg._core.geometry import distance, vectorized_angle_fn, vectorized_dihedral_fn
+from diffcg._core.periodic import make_displacement_with_cached_inverse
+from diffcg._core.math import high_precision_sum
 
 def tabulated(dr: jnp.ndarray, spline: Callable[[jnp.ndarray], jnp.ndarray], **unused_kwargs
               ) -> jnp.ndarray:
@@ -28,6 +28,30 @@ def tabulated(dr: jnp.ndarray, spline: Callable[[jnp.ndarray], jnp.ndarray], **u
     """
 
     return spline(dr)
+
+def _smooth_cutoff_factor(dr, r_onset, r_cutoff):
+  """Compute C1-smooth cutoff factor S(r) in [0, 1].
+
+  S(r) = 1 for r < r_onset, S(r) = 0 for r > r_cutoff, and smoothly
+  interpolated in between (HOOMD Blue scheme).
+
+  Args:
+    dr: An ndarray of pairwise distances.
+    r_onset: Distance marking the onset of deformation.
+    r_cutoff: Cutoff distance.
+
+  Returns:
+    Array of cutoff factors in [0, 1], same shape as dr.
+  """
+  r_c = r_cutoff ** 2
+  r_o = r_onset ** 2
+  r = dr ** 2
+
+  inner = jnp.where(dr < r_cutoff,
+                   (r_c - r)**2 * (r_c + 2 * r - 3 * r_o) / (r_c - r_o)**3,
+                   0)
+  return jnp.where(dr < r_onset, 1, inner)
+
 
 def multiplicative_isotropic_cutoff(fn: Callable[..., jnp.ndarray],
                                     r_onset: float,
@@ -57,21 +81,9 @@ def multiplicative_isotropic_cutoff(fn: Callable[..., jnp.ndarray],
       https://hoomd-blue.readthedocs.io/en/stable/module-md-pair.html#hoomd.md.pair.pair
   """
 
-  r_c = r_cutoff ** 2
-  r_o = r_onset ** 2
-
-  def smooth_fn(dr):
-    r = dr ** 2
-
-    inner = jnp.where(dr < r_cutoff,
-                     (r_c - r)**2 * (r_c + 2 * r - 3 * r_o) / (r_c - r_o)**3,
-                     0)
-
-    return jnp.where(dr < r_onset, 1, inner)
-
   @wraps(fn)
   def cutoff_fn(dr, *args, **kwargs):
-    return smooth_fn(dr) * fn(dr, *args, **kwargs)
+    return _smooth_cutoff_factor(dr, r_onset, r_cutoff) * fn(dr, *args, **kwargs)
 
   return cutoff_fn
 
@@ -132,6 +144,31 @@ def harmonic_dihedral(angle,
   agreement when alpha = 2.
   """
   return epsilon / alpha * (angle - angle_0) ** alpha
+
+def build_pair_type_map(n_atom_types):
+    """Build symmetric (type_i, type_j) -> pair_type_index mapping.
+
+    Upper-triangle ordering: (0,0)=0, (0,1)=1, ..., (1,1)=n, ...
+    Symmetric: map[i,j] == map[j,i].
+
+    Args:
+        n_atom_types: Number of distinct atom types.
+
+    Returns:
+        pair_type_map: (n_atom_types, n_atom_types) int32 array
+        n_pair_types: int, total number of unique pair types = n*(n+1)//2
+    """
+    n = n_atom_types
+    n_pair_types = n * (n + 1) // 2
+    pair_map = jnp.zeros((n, n), dtype=jnp.int32)
+    idx = 0
+    for i in range(n):
+        for j in range(i, n):
+            pair_map = pair_map.at[i, j].set(idx)
+            pair_map = pair_map.at[j, i].set(idx)
+            idx += 1
+    return pair_map, n_pair_types
+
 
 def build_bonded_pair_set(topology):
     """Pre-compute set of bonded atom pairs for O(1) lookup.
@@ -227,24 +264,42 @@ def mask_bonded_neighbors(idx, topology, max_num_atoms, bonded_pairs=None):
 
 
 def _get_edge_list_from_jaxmd_neighbors(neighbors):
-    """Convert JAX-MD Sparse neighbor list to edge-list format.
+    """Convert JAX-MD Dense neighbor list to edge-list format.
 
-    JAX-MD Sparse format: neighbors.idx with shape [N, max_neighbors]
+    IMPORTANT: This function expects Dense format with shape [N, max_neighbors_per_particle].
+    If using JAX-MD partition.Sparse format (shape [2, max_neighbors]), this will fail!
+
+    JAX-MD Dense format: neighbors.idx with shape [N, max_neighbors_per_particle]
       - idx[i, j] = j-th neighbor of particle i
       - Padding value = N for unused slots
 
     Args:
-        neighbors: JAX-MD neighbor list object with .idx attribute
+        neighbors: JAX-MD neighbor list object with .idx attribute (Dense format required)
 
     Returns:
         Tuple of (centers, others, N) where:
           - centers: 1D array of center atom indices
           - others: 1D array of neighbor atom indices
           - N: Number of particles (from neighbor list)
+
+    Raises:
+        AssertionError: If neighbor list appears to be in wrong format (N < 10 suggests Sparse format)
     """
     idx = neighbors.idx
     N = idx.shape[0]
     max_neighbors = idx.shape[1]
+
+    # Sanity check: If N == 2 and max_neighbors > N, likely using wrong format (Sparse has shape (2, total_pairs))
+    # Dense format should have N = number of particles, max_neighbors = capacity per particle
+    # Sparse format has N = 2 (for i,j pairs), max_neighbors = total number of pairs
+    if N == 2 and max_neighbors > 100:
+        raise AssertionError(
+            f"Neighbor list has suspicious shape ({N}, {max_neighbors}). "
+            f"This looks like partition.Sparse format (shape (2, num_pairs)). "
+            f"This function requires Dense format with shape (N_particles, max_neighbors_per_particle). "
+            f"Change neighbor list format to partition.Dense in jaxmd_sampler.py"
+        )
+
     centers = jnp.repeat(jnp.arange(N), max_neighbors)
     others = idx.flatten()
     return centers, others, N
@@ -443,14 +498,25 @@ class HarmonicDihedralEnergy:
         return energy_fn
 
 class GenericRepulsionEnergy:
-    def __init__(self, sigma=0.6, epsilon=1., exp=8,mask_topology=None,max_num_atoms=None,r_onset=0.9,r_cutoff=1.0):
-        self.sigma = sigma
-        self.epsilon = epsilon
-        self.exp = exp
+    def __init__(self, sigma=0.6, epsilon=1., exp=8, mask_topology=None,
+                 max_num_atoms=None, r_onset=0.9, r_cutoff=1.0,
+                 atom_types=None, pair_type_map=None):
         self.mask_topology = mask_topology
         self.max_num_atoms = max_num_atoms
         self.r_onset = r_onset
         self.r_cutoff = r_cutoff
+        self.atom_types = None if atom_types is None else jnp.asarray(atom_types, dtype=jnp.int32)
+        self.pair_type_map = None if pair_type_map is None else jnp.asarray(pair_type_map, dtype=jnp.int32)
+
+        if self.atom_types is not None:
+            self.sigma = jnp.atleast_1d(jnp.asarray(sigma))
+            self.epsilon = jnp.atleast_1d(jnp.asarray(epsilon))
+            self.exp = jnp.atleast_1d(jnp.asarray(exp, dtype=jnp.float64))
+        else:
+            self.sigma = sigma
+            self.epsilon = epsilon
+            self.exp = exp
+
         # Pre-compute bonded pairs for O(n log m) lookup
         self.bonded_pairs = None
         if mask_topology is not None:
@@ -472,7 +538,17 @@ class GenericRepulsionEnergy:
                 edges = vmap(disp_fn)(positions[centers], positions[safe_others])
                 dr = vmap(distance)(edges)
 
-                _energy = multiplicative_isotropic_cutoff(generic_repulsion, self.r_onset, self.r_cutoff)(dr, self.sigma, self.epsilon, self.exp)
+                if self.atom_types is not None:
+                    type_i = self.atom_types[centers]
+                    type_j = self.atom_types[safe_others]
+                    pair_types = self.pair_type_map[type_i, type_j]
+                    sigma_vals = self.sigma[pair_types]
+                    epsilon_vals = self.epsilon[pair_types]
+                    exp_vals = self.exp[pair_types]
+                else:
+                    sigma_vals, epsilon_vals, exp_vals = self.sigma, self.epsilon, self.exp
+
+                _energy = _smooth_cutoff_factor(dr, self.r_onset, self.r_cutoff) * generic_repulsion(dr, sigma_vals, epsilon_vals, exp_vals)
                 mask = others < N  # Filter padding (JAX-MD uses N as padding value for unused neighbor slots)
 
                 out = _energy * mask
@@ -503,7 +579,17 @@ class GenericRepulsionEnergy:
                 edges = vmap(disp_fn)(positions[centers], positions[safe_others])
                 dr = vmap(distance)(edges)
 
-                _energy = multiplicative_isotropic_cutoff(generic_repulsion, self.r_onset, self.r_cutoff)(dr, self.sigma, self.epsilon, self.exp)
+                if self.atom_types is not None:
+                    type_i = self.atom_types[centers]
+                    type_j = self.atom_types[safe_others]
+                    pair_types = self.pair_type_map[type_i, type_j]
+                    sigma_vals = self.sigma[pair_types]
+                    epsilon_vals = self.epsilon[pair_types]
+                    exp_vals = self.exp[pair_types]
+                else:
+                    sigma_vals, epsilon_vals, exp_vals = self.sigma, self.epsilon, self.exp
+
+                _energy = _smooth_cutoff_factor(dr, self.r_onset, self.r_cutoff) * generic_repulsion(dr, sigma_vals, epsilon_vals, exp_vals)
                 out = _energy * mask
                 return high_precision_sum(out) * 0.5
 
@@ -511,21 +597,34 @@ class GenericRepulsionEnergy:
 
 
 class TabulatedPairEnergy:
-    def __init__(self, x_vals, y_vals,r_onset,r_cutoff,mask_topology=None,max_num_atoms=None):
+    def __init__(self, x_vals, y_vals, r_onset, r_cutoff,
+                 mask_topology=None, max_num_atoms=None,
+                 atom_types=None, pair_type_map=None):
         self.x_vals = x_vals
-        self.y_vals = y_vals
+        self.y_vals = jnp.atleast_2d(jnp.asarray(y_vals))  # (n_pair_types, N_grid) or (1, N_grid)
         self.r_onset = r_onset
         self.r_cutoff = r_cutoff
         self.mask_topology = mask_topology
         self.max_num_atoms = max_num_atoms
+        self.atom_types = None if atom_types is None else jnp.asarray(atom_types, dtype=jnp.int32)
+        self.pair_type_map = None if pair_type_map is None else jnp.asarray(pair_type_map, dtype=jnp.int32)
+        self.n_pair_types = self.y_vals.shape[0]
         # Pre-compute bonded pairs for O(n log m) lookup
         self.bonded_pairs = None
         if mask_topology is not None:
             self.bonded_pairs = build_bonded_pair_set(mask_topology)
 
     def get_energy_fn(self):
-        spline = custom_interpolate.MonotonicInterpolate(self.x_vals, self.y_vals)
-        tabulated_partial = partial(tabulated, spline=spline)
+        # Create one spline per pair type
+        splines = [custom_interpolate.MonotonicInterpolate(self.x_vals, self.y_vals[i])
+                    for i in range(self.n_pair_types)]
+
+        if self.atom_types is None:
+            # Single-type path: use first (only) spline with multiplicative cutoff
+            tabulated_partial = partial(tabulated, spline=splines[0])
+            truncated_fn = multiplicative_isotropic_cutoff(tabulated_partial, self.r_onset, self.r_cutoff)
+        else:
+            truncated_fn = None  # not used in per-type path
 
         if self.mask_topology is None:
             def energy_fn(system, neighbors, **dynamic_kwargs):
@@ -542,10 +641,19 @@ class TabulatedPairEnergy:
                 edges = vmap(disp_fn)(positions[centers], positions[safe_others])
                 dr = vmap(distance)(edges)
 
-                truncated_fn = multiplicative_isotropic_cutoff(tabulated_partial, self.r_onset, self.r_cutoff)
                 mask = others < N  # Filter padding
 
-                _energy = truncated_fn(dr)
+                if self.atom_types is not None:
+                    type_i = self.atom_types[centers]
+                    type_j = self.atom_types[safe_others]
+                    pair_types = self.pair_type_map[type_i, type_j]
+                    def eval_spline(type_idx, d):
+                        return jax.lax.switch(type_idx, [lambda d, s=s: s(d) for s in splines], d)
+                    raw_energies = vmap(eval_spline)(pair_types, dr)
+                    _energy = _smooth_cutoff_factor(dr, self.r_onset, self.r_cutoff) * raw_energies
+                else:
+                    _energy = truncated_fn(dr)
+
                 out = _energy * mask
                 return high_precision_sum(out) * 0.5
 
@@ -574,9 +682,17 @@ class TabulatedPairEnergy:
                 edges = vmap(disp_fn)(positions[centers], positions[safe_others])
                 dr = vmap(distance)(edges)
 
-                truncated_fn = multiplicative_isotropic_cutoff(tabulated_partial, self.r_onset, self.r_cutoff)
+                if self.atom_types is not None:
+                    type_i = self.atom_types[centers]
+                    type_j = self.atom_types[safe_others]
+                    pair_types = self.pair_type_map[type_i, type_j]
+                    def eval_spline(type_idx, d):
+                        return jax.lax.switch(type_idx, [lambda d, s=s: s(d) for s in splines], d)
+                    raw_energies = vmap(eval_spline)(pair_types, dr)
+                    _energy = _smooth_cutoff_factor(dr, self.r_onset, self.r_cutoff) * raw_energies
+                else:
+                    _energy = truncated_fn(dr)
 
-                _energy = truncated_fn(dr)
                 out = _energy * mask
                 return high_precision_sum(out) * 0.5
 

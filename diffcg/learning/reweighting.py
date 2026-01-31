@@ -11,8 +11,8 @@ import time
 import sys
 import os
 
-from diffcg.util.logger import get_logger
-from diffcg.util.math import high_precision_sum
+from diffcg._core.logger import get_logger
+from diffcg._core.math import high_precision_sum
 
 logger = get_logger(__name__)
 

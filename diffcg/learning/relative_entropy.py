@@ -11,14 +11,14 @@ import os
 from shutil import copy2
 from pathlib import Path
 from jax import lax
-from ase.io import read
 
-from diffcg.util.logger import get_logger
-from diffcg.md.calculator import CustomEnergyCalculator, init_energy_calculator
+from diffcg._core.logger import get_logger
+from diffcg._core.constants import BOLTZMANN_KJMOLK
+from diffcg.md.calculator import compute_energy, init_energy_calculator
 from diffcg.learning.reweighting import ReweightEstimator
-from diffcg.system import trj_atom_to_system, System
-from diffcg.common.neighborlist import jaxmd_neighbor_list
-from diffcg.md.sample import MolecularDynamics
+from diffcg.system import AtomicSystem, Trajectory, System
+from diffcg._core.neighborlist import jaxmd_neighbor_list
+from diffcg.md.sample import MolecularDynamics, create_equilibration_run, create_production_run
 
 def _tree_sum_batch(tree, axis: int = 0):
     """Sum a batched pytree along a given axis for every leaf."""
@@ -53,23 +53,24 @@ def init_relative_entropy(
     build_energy_fn_with_params_fn,
     optimizer,
     reweight_ratio: float,
-    Boltzmann_constant: float = 0.0083145107,
+    Boltzmann_constant: float = BOLTZMANN_KJMOLK,
 ):
     """Initialize a single-state Relative Entropy (RE) update function.
 
     The RE loss (up to an additive constant independent of parameters) is
-        L_RE(θ) = β E_ref[U_θ] - log E_{p_base}[exp(-β (U_θ - U_base))],
+        L_RE(theta) = beta E_ref[U_theta] - log E_{p_base}[exp(-beta (U_theta - U_base))],
     where p_base is the CG distribution at the previous parameters (old_params).
 
     Args:
-        ref_traj_path: ASE trajectory path of the mapped AA→CG reference frames.
+        ref_traj_path: Path to reference trajectory (.npz format) or a
+            pre-loaded Trajectory object. Legacy .traj files are supported
+            via ``diffcg.io.ase_trj`` with a deprecation warning.
         state: Dict with keys:
-            - 'init_atoms': ASE Atoms
+            - 'init_system': AtomicSystem (or 'init_atoms' for backward compat)
             - 'r_cut': float (optional)
-            - 'sampler_params': MD sampler params; must include 'trajectory' and 'logfile' prefixes
-            - 'sim_time_scheme': dict with either
+            - 'sampler_params': MD sampler params
+            - 'sim_time_scheme': dict with
                 {'equilibration_steps': int, 'production_steps': int}
-                or {'total_simulation_steps': int}
         build_energy_fn_with_params_fn: Callable (params, max_num_atoms) -> energy_fn
         optimizer: optax optimizer
         reweight_ratio: Threshold for n_eff to decide whether to recompute the CG trajectory.
@@ -80,63 +81,67 @@ def init_relative_entropy(
             (new_params, params, opt_state, loss_val, metrics)
     """
 
-    # Load reference trajectory once
-    ref_trajs = read(ref_traj_path, index=':')
-    if len(ref_trajs) == 0:
+    # Load reference trajectory
+    if isinstance(ref_traj_path, Trajectory):
+        ref_traj = ref_traj_path
+    elif isinstance(ref_traj_path, str) and ref_traj_path.endswith('.traj'):
+        import warnings
+        warnings.warn(
+            "Loading .traj files is deprecated. Convert to .npz format using "
+            "diffcg.io.ase_trj and Trajectory.save().",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        from diffcg.io.ase_trj import read_ase_trj
+        ref_traj = read_ase_trj(ref_traj_path)
+    else:
+        ref_traj = Trajectory.load(ref_traj_path)
+    if len(ref_traj) == 0:
         raise ValueError(f"No frames found in reference trajectory: {ref_traj_path}")
+
+    # Resolve init_system from state (support both 'init_system' and 'init_atoms')
+    if 'init_system' in state:
+        init_system = state['init_system']
+    elif 'init_atoms' in state:
+        init_system = state['init_atoms']
+    else:
+        raise ValueError("state must contain 'init_system' or 'init_atoms'")
+    if not isinstance(init_system, AtomicSystem):
+        raise TypeError(
+            f"init_system must be an AtomicSystem, got {type(init_system).__name__}. "
+            "ASE Atoms conversion has been removed; convert with "
+            "diffcg.system.from_ase_atoms() before passing to init_relative_entropy."
+        )
 
     # Prepare constants and helpers
     temperature = state['sampler_params']['temperature']
     beta = 1.0 / (temperature * Boltzmann_constant)
-    max_num_atoms = state['init_atoms'].get_global_number_of_atoms()
+    max_num_atoms = init_system.n_atoms
 
-    def create_md_equ(step, init_atoms, sample_energy_fn):
-        sampler_params = state['sampler_params']
-        r_cut = state.get('r_cut', 1.0)
+    r_cut = state.get('r_cut', 1.0)
 
-        md_equ = MolecularDynamics(
-            init_atoms,
-            energy_fn=sample_energy_fn,
-            ensemble=sampler_params['ensemble'],
-            thermostat=sampler_params['thermostat'],
-            temperature=sampler_params['temperature'],
-            starting_temperature=sampler_params['starting_temperature'],
-            timestep=sampler_params['timestep'],
-            cutoff=r_cut,
-            friction=sampler_params.get('friction', 1.0),
-            trajectory=None,
-            logfile=None,
-            loginterval=1,
+    def create_md_equ(step, start_system, sample_energy_fn):
+        return create_equilibration_run(
+            start_system, sample_energy_fn, state['sampler_params'], r_cut,
         )
-        return md_equ
 
-    def create_md_prd(step, init_atoms, sample_energy_fn):
+    def create_md_prd(step, start_system, sample_energy_fn):
         sampler_params = state['sampler_params']
-        r_cut = state.get('r_cut', 1.0)
+        return create_production_run(
+            start_system, sample_energy_fn, sampler_params, r_cut,
+            trajectory=f"{sampler_params['trajectory']}{step}.npz",
+            logfile=f"{sampler_params['logfile']}{step}.log",
+            loginterval=sampler_params['loginterval'],
+        )
 
-        md_prod = MolecularDynamics(
-                init_atoms,
-                energy_fn=sample_energy_fn,
-                ensemble=sampler_params['ensemble'],
-                thermostat=sampler_params['thermostat'],
-                temperature=sampler_params['temperature'],
-                starting_temperature=sampler_params['starting_temperature'],
-                timestep=sampler_params['timestep'],
-                cutoff=r_cut,
-                friction=sampler_params.get('friction', 1.0),
-                trajectory=f"{sampler_params['trajectory']}{step}.traj",
-                logfile=f"{sampler_params['logfile']}{step}.log",
-                loginterval=sampler_params['loginterval'],
-            )
-        return md_prod
-
-    def rerun_energy(params, traj):
-        results = []
+    def rerun_energy(params, traj: Trajectory):
         energy_fn = build_energy_fn_with_params_fn(params, max_num_atoms=max_num_atoms)
-        calculator = CustomEnergyCalculator(energy_fn, cutoff=state.get('r_cut', 1.0))
-        for atoms in traj:
-            calculator.calculate(atoms)
-            results.append(calculator.results)
+        r_cut = state.get('r_cut', 1.0)
+        results = []
+        for i in range(len(traj)):
+            sys_i = traj[i]
+            e_i = compute_energy(sys_i, energy_fn, cutoff=r_cut)
+            results.append(e_i)
         return jnp.stack(results)
 
     def update_fn(step, params, old_params, opt_state):
@@ -150,16 +155,17 @@ def init_relative_entropy(
 
         # Prepare CG proposal trajectories: run or reuse
         if step == 0:
-            md_equ = create_md_equ(step, state['init_atoms'], sample_energy_fn)
+            md_equ = create_md_equ(step, init_system, sample_energy_fn)
             md_equ.run(scheme['equilibration_steps'])
-            md_prod = create_md_prd(step, md_equ.atoms, sample_energy_fn)
+            md_prod = create_md_prd(step, md_equ.get_final_system(), sample_energy_fn)
             md_prod.run(scheme['production_steps'])
-            trajs_cg = read(f"{sampler_params['trajectory']}{step}.traj", index=':')
+            trajs_cg = md_prod.get_trajectory()
         else:
-            logger.info(f"Reusing trajectory {step-1}")
-            copy2(f"{sampler_params['trajectory']}{step-1}.traj", f"{sampler_params['trajectory']}{step}.traj")
+            logger.debug(f"Reusing trajectory {step-1}")
+            copy2(f"{sampler_params['trajectory']}{step-1}.npz", f"{sampler_params['trajectory']}{step}.npz")
             copy2(f"{sampler_params['logfile']}{step-1}.log", f"{sampler_params['logfile']}{step}.log")
-            trajs_cg = read(f"{sampler_params['trajectory']}{step}.traj", index=':')
+            # Load saved trajectory
+            trajs_cg = Trajectory.load(f"{sampler_params['trajectory']}{step}.npz")
 
         # Base energies on CG frames under old params (reference for FEP)
         U_base_cg = rerun_energy(old_params, trajs_cg)
@@ -174,13 +180,12 @@ def init_relative_entropy(
             return jax.tree_map(lambda g: weight * g, snapshot_grad)
 
         reweight_estimator = ReweightEstimator(ref_energies=U_base_cg, kBT=temperature*Boltzmann_constant)
-        
-        ref_trajs_system = trj_atom_to_system(ref_trajs)
-        trajs_cg_system = trj_atom_to_system(trajs_cg)
+
+        ref_trajs_batched = ref_traj.to_batched_system()
+        trajs_cg_batched = trajs_cg.to_batched_system()
 
         def precompute_neighbors_batched(batched_system: System):
             batch_size = batched_system.R.shape[0]
-            # Allocate on first frame to fix capacities; reuse for others via update
             sys0 = System(R=batched_system.R[0], Z=batched_system.Z[0], cell=batched_system.cell[0])
             neighbors0, spatial_partitioning = jaxmd_neighbor_list(
                 positions=sys0.R,
@@ -196,13 +201,13 @@ def init_relative_entropy(
             neighbors_batched = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs, axis=0), *neighbors_list)
             return neighbors_batched
 
-        ref_neighbors = precompute_neighbors_batched(ref_trajs_system)
-        cg_neighbors = precompute_neighbors_batched(trajs_cg_system)
+        ref_neighbors = precompute_neighbors_batched(ref_trajs_batched)
+        cg_neighbors = precompute_neighbors_batched(trajs_cg_batched)
 
         def re_gradient(p):
-            # Reference contribution: β E_ref[U_θ]
-            U_ref_theta = rerun_energy(p, ref_trajs)
-            ref_weights = jnp.ones(len(ref_trajs)) / (len(ref_trajs))
+            # Reference contribution: beta E_ref[U_theta]
+            U_ref_theta = rerun_energy(p, ref_traj)
+            ref_weights = jnp.ones(len(ref_traj)) / (len(ref_traj))
 
             # Chunked vmap to control memory
             def accumulate_batched(system_b, neighbors_b, weights_b, chunk_size: int = 32):
@@ -218,11 +223,11 @@ def init_relative_entropy(
                     acc = grads_sum if acc is None else _tree_add(acc, grads_sum)
                 return acc
 
-            mean_ref_grad = accumulate_batched(ref_trajs_system, ref_neighbors, ref_weights)
+            mean_ref_grad = accumulate_batched(ref_trajs_batched, ref_neighbors, ref_weights)
 
             energies_cg = rerun_energy(p, trajs_cg)
             weights, n_eff = reweight_estimator.estimate_weight(energies_cg)
-            mean_gen_grad = accumulate_batched(trajs_cg_system, cg_neighbors, weights)
+            mean_gen_grad = accumulate_batched(trajs_cg_batched, cg_neighbors, weights)
 
             combine_grads = lambda x, y: beta * (x - y)
             grad_val = jax.tree_map(combine_grads, mean_ref_grad, mean_gen_grad)
@@ -231,32 +236,31 @@ def init_relative_entropy(
                 'RE_grad': grad_val,
                 'n_eff': n_eff,
                 'num_cg_frames': jnp.array(len(trajs_cg), dtype=jnp.float32),
-                'num_ref_frames': jnp.array(len(ref_trajs), dtype=jnp.float32),
+                'num_ref_frames': jnp.array(len(ref_traj), dtype=jnp.float32),
             }
             return grad_val, metrics
 
         grad, metrics = re_gradient(params)
         scaled_grad, opt_state = optimizer.update(grad, opt_state, params)
         new_params = optax.apply_updates(params, scaled_grad)
-        
-        # Decide whether to recompute trajectory for next step using n_eff heuristic (keep convention in reweighting.py)
+
+        # Decide whether to recompute trajectory for next step
         n_eff_val = float(metrics['n_eff'])
         recompute = (n_eff_val > reweight_ratio * len(trajs_cg)) and (step > 0)
         if recompute:
             sample_energy_fn = build_energy_fn_with_params_fn(new_params, max_num_atoms=max_num_atoms)
-            logger.info(
+            logger.debug(
                 f"Recomputing trajectory {step} because n_eff = {n_eff_val} > {reweight_ratio * len(trajs_cg)}"
             )
             try:
                 Path(f"{sampler_params['logfile']}{step}.log").unlink(missing_ok=True)
             except TypeError:
-                # Python <3.8 compatibility
                 p = Path(f"{sampler_params['logfile']}{step}.log")
                 if p.exists():
                     p.unlink()
-            md_equ = create_md_equ(step, state['init_atoms'], sample_energy_fn)
+            md_equ = create_md_equ(step, init_system, sample_energy_fn)
             md_equ.run(scheme['equilibration_steps'])
-            md_prod = create_md_prd(step, md_equ.atoms, sample_energy_fn)
+            md_prod = create_md_prd(step, md_equ.get_final_system(), sample_energy_fn)
             md_prod.run(scheme['production_steps'])
 
         # Placeholder loss; compute actual RE loss if needed
@@ -299,4 +303,3 @@ def optimize_relative_entropy(update_fn, params, total_iterations):
         params_set.append(params)
 
     return gradient_norm_history, times_per_update, metrics_history, params_set
-

@@ -4,18 +4,21 @@
 import jax.numpy as jnp
 from jax import lax
 from jax.tree_util import tree_map
-from diffcg.util.logger import get_logger
-from diffcg.system import atoms_to_system
+from diffcg._core.logger import get_logger
+from diffcg.system import AtomicSystem, from_ase_atoms
 
 logger = get_logger(__name__)
 
-class analyze():
-    def __init__(self,compute_fn,init_atoms):
+class TrajectoryAnalyzer():
+    def __init__(self, compute_fn, init_system):
         self.compute_fn = compute_fn
-        self.system = atoms_to_system(init_atoms)
-        
+        # Accept both AtomicSystem and ASE Atoms (backward compat)
+        if isinstance(init_system, AtomicSystem):
+            self.system = init_system
+        else:
+            self.system = from_ase_atoms(init_system)
 
-    def analyze(self,batched_systems):
+    def analyze(self, batched_systems):
         B = batched_systems.R.shape[0]
         proto = self.compute_fn(self.system)
         def body(carry, i):
@@ -26,4 +29,3 @@ class analyze():
         _, observables = lax.scan(body, jnp.zeros_like(proto), jnp.arange(B))
         logger.debug("Analyzed %s frames", B)
         return observables
-    

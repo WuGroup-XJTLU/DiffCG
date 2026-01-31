@@ -7,7 +7,7 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional, Union
 import re
 from pathlib import Path
-from diffcg.util.logger import get_logger
+from diffcg._core.logger import get_logger
 
 logger = get_logger(__name__)
 
