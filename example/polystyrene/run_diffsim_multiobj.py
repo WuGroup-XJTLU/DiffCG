@@ -18,7 +18,7 @@ from diffcg.learning.diffsim import init_multistate_diffsim, optimize_multistate
 
 from common import (
     load_targets, load_system, load_pretrained_params,
-    build_quantity_dict, build_energy_fn, make_calculate_observables_fn,
+    build_quantity_dict, build_energy_fn, build_exclusion_mask,
     R_CUT, BOLTZMANN_CONSTANT,
 )
 
@@ -38,10 +38,13 @@ for temp in temperatures:
 topology = topologies[temperatures[0]]
 pretrained_params = load_pretrained_params()
 
+# ── Exclusion mask ────────────────────────────────────────────────────
+custom_mask_function = build_exclusion_mask(topology, exclusion_level=3)
+
 
 # ── Energy builder (no per-type pairs) ─────────────────────────────────
 def build_energy_fn_with_params(params, max_num_atoms=1):
-    return build_energy_fn(params, topology, max_num_atoms=max_num_atoms)
+    return build_energy_fn(params, topology)
 
 
 # ── Optimizer ──────────────────────────────────────────────────────────
@@ -70,21 +73,18 @@ for temp in temperatures:
         "logfile": f"sample_T{temp}_",
         "loginterval": 12,
     }
-    calculate_observables_fn = make_calculate_observables_fn(
-        quantity_dicts[temp], init_systems[temp]
-    )
     states[state_id] = {
         "init_system": init_systems[temp],
         "r_cut": R_CUT,
         "quantity_dict": quantity_dicts[temp],
-        "calculate_observables_fn": calculate_observables_fn,
         "sampler_params": sampler_params,
         "sim_time_scheme": sim_time_scheme,
+        "custom_mask_function": custom_mask_function,
     }
     state_weights[state_id] = 1.0
 
 # ── Run multi-state DiffSim ───────────────────────────────────────────
-update_fn = init_multistate_diffsim(
+generate_trajectories_fn, update_fn, loss_fn_by_state, compute_observables_fn = init_multistate_diffsim(
     reweight_ratio=0.9,
     states=states,
     build_energy_fn_with_params_fn=build_energy_fn_with_params,
@@ -95,7 +95,9 @@ update_fn = init_multistate_diffsim(
 )
 
 loss_history, times_per_update, predictions_history, params_set, per_state_loss_history = (
-    optimize_multistate_diffsim(update_fn, pretrained_params, total_iterations=1)
+    optimize_multistate_diffsim(generate_trajectories_fn, update_fn, pretrained_params, total_iterations=1,
+                                 states=states, optimizer=optimizer, loss_fn_by_state=loss_fn_by_state,
+                                 compute_observables_fn=compute_observables_fn)
 )
 
 print("Final per-state losses:")

@@ -8,18 +8,22 @@ enabling gradient flow through MD trajectories for DiffSim and related methods.
 """
 
 from functools import partial
-from typing import Callable, Optional, Tuple, Any, Dict
+from typing import Callable, Optional, Tuple, Any, Dict, Union
 from collections import namedtuple
 
 import jax
 import jax.numpy as jnp
 from jax import random
-from jax_md import simulate, space, partition
+from jax_md import simulate, space, partition, quantity
 
 from diffcg.system import System
 from diffcg._core.neighborlist import jaxmd_neighbor_list, JAXMDSpatialPartitioning
 from diffcg._core.logger import get_logger
 from diffcg._core.constants import BOLTZMANN_KJMOLK
+from diffcg.md.integrators import (
+    nvt_langevin as custom_nvt_langevin,
+    nve as custom_nve,
+)
 
 logger = get_logger(__name__)
 
@@ -33,7 +37,7 @@ KB_KJ_MOL = BOLTZMANN_KJMOLK
 FS_TO_INTERNAL = 0.001
 
 # Result container for MD simulation
-MDResult = namedtuple("MDResult", ("final_state", "trajectory", "final_neighbors"))
+MDResult = namedtuple("MDResult", ("final_state", "trajectory", "final_neighbors", "thermo"))
 
 
 def _wrap_energy_fn_for_jaxmd(
@@ -87,6 +91,8 @@ class JAXMDSampler:
         taup: Optional[float] = None,
         friction: float = 1.0,
         mass: Optional[jnp.ndarray] = None,
+        custom_mask_function: Optional[Callable] = None,
+        compute_pressure: bool = False,
         **kwargs
     ):
         """Initialize the JAX-MD sampler.
@@ -107,6 +113,7 @@ class JAXMDSampler:
             taup: Pressure coupling time constant in fs (for NPT Nose-Hoover).
             friction: Friction coefficient in 1/ps (for Langevin).
             mass: Particle masses. If None, uses unit masses.
+            compute_pressure: If True, compute virial pressure each step (opt-in).
             **kwargs: Additional keyword arguments.
         """
         self.Z = Z
@@ -120,6 +127,7 @@ class JAXMDSampler:
 
         # Compute thermal energy
         self.kT = kT if kT is not None else temperature * KB_KJ_MOL
+        self.compute_pressure = compute_pressure and cell is not None
 
         # Convert timestep to internal units
         dt = timestep * FS_TO_INTERNAL
@@ -155,12 +163,18 @@ class JAXMDSampler:
         self._wrapped_energy_fn = _wrap_energy_fn_for_jaxmd(energy_fn, Z, cell)
 
         # Create neighbor list function
-        self.neighbor_fn = partition.neighbor_list(
-            self.displacement_fn,
+        nl_kwargs = dict(
             box=self.box,
             r_cutoff=cutoff,
             capacity_multiplier=capacity_multiplier,
             format=partition.Dense,  # Fixed: was Sparse, but _get_edge_list_from_jaxmd_neighbors expects Dense format
+        )
+        if custom_mask_function is not None:
+            nl_kwargs['custom_mask_function'] = custom_mask_function
+
+        self.neighbor_fn = partition.neighbor_list(
+            self.displacement_fn,
+            **nl_kwargs,
         )
 
         # Select and create integrator
@@ -179,7 +193,10 @@ class JAXMDSampler:
         pressure: float,
         mass: Optional[jnp.ndarray],
     ) -> None:
-        """Create the appropriate JAX-MD integrator.
+        """Create the appropriate integrator.
+
+        Uses custom integrators (with value_and_grad for free PE) for NVE and
+        NVT Langevin.  Falls back to JAX-MD integrators for Nose-Hoover and NPT.
 
         Args:
             dt: Time step in internal units.
@@ -191,27 +208,30 @@ class JAXMDSampler:
         def energy_fn_with_neighbors(R, neighbor, **kwargs):
             return self._wrapped_energy_fn(R, neighbor, **kwargs)
 
+        # Track whether the integrator stores PE natively in state
+        self._has_native_pe = False
+
         if self.ensemble == 'nve':
-            self.init_fn, self.apply_fn = simulate.nve(
+            self.init_fn, self.apply_fn = custom_nve(
                 energy_fn_with_neighbors,
                 self.shift_fn,
                 dt,
             )
-            logger.debug("Using NVE integrator")
+            self._has_native_pe = True
+            logger.debug("Using custom NVE integrator (with PE capture)")
 
         elif self.ensemble == 'nvt':
             if self.thermostat == 'langevin':
-                # Friction coefficient in 1/ps (no conversion needed for JAX-MD)
-                # JAX-MD expects gamma in 1/ps even though timestep dt is in fs
                 gamma = friction
-                self.init_fn, self.apply_fn = simulate.nvt_langevin(
+                self.init_fn, self.apply_fn = custom_nvt_langevin(
                     energy_fn_with_neighbors,
                     self.shift_fn,
                     dt,
                     self.kT,
                     gamma,
                 )
-                logger.debug("Using NVT Langevin integrator with gamma=%s", gamma)
+                self._has_native_pe = True
+                logger.debug("Using custom NVT Langevin integrator with gamma=%s (with PE capture)", gamma)
 
             elif self.thermostat == 'nose-hoover':
                 self.init_fn, self.apply_fn = simulate.nvt_nose_hoover(
@@ -231,9 +251,6 @@ class JAXMDSampler:
 
         elif self.ensemble == 'npt':
             # NPT only supports Nose-Hoover in JAX-MD
-            # Convert pressure from bar to internal units (kJ/(mol*nm^3))
-            # 1 bar = 0.0602214 kJ/(mol*nm^3)
-            # Using inverse conversion: 1 kJ/(mol*nm^3) = 16.6054 bar
             pressure_internal = pressure / 16.6054  # bar to kJ/(mol*nm^3)
 
             self.init_fn, self.apply_fn = simulate.npt_nose_hoover(
@@ -254,6 +271,13 @@ class JAXMDSampler:
             raise ValueError(
                 f"Unsupported ensemble: {self.ensemble}. "
                 "Use 'nve', 'nvt', or 'npt'."
+            )
+
+        # For fallback integrators without native PE, create a stop-gradient
+        # energy function for thermo logging (separate forward pass, no grad).
+        if not self._has_native_pe:
+            self._pe_fn = lambda R, **kw: jax.lax.stop_gradient(
+                energy_fn_with_neighbors(R, **kw)
             )
 
     def initialize_state(
@@ -298,6 +322,35 @@ class JAXMDSampler:
         new_neighbor = self.neighbor_fn.update(new_state.position, neighbor)
         return new_state, new_neighbor
 
+    def _compute_thermo(self, state, neighbor):
+        """Compute thermodynamic quantities from current state.
+
+        Returns:
+            Tuple of (KE, PE, temperature, total_energy, pressure) as scalars.
+            Pressure is 0.0 when compute_pressure is False.
+        """
+        # Use mass from state (already canonicalized to (N,1) for broadcasting)
+        mass = state.mass
+        if self._has_native_pe:
+            pe = state.potential_energy
+        else:
+            pe = self._pe_fn(state.position, neighbor=neighbor)
+
+        ke = quantity.kinetic_energy(momentum=state.momentum, mass=mass)
+        temp = quantity.temperature(momentum=state.momentum, mass=mass) / KB_KJ_MOL
+        etotal = ke + pe
+
+        if self.compute_pressure:
+            from diffcg.observable.pressure import compute_instantaneous_pressure
+            sys_i = System(R=state.position, Z=self.Z, cell=self.cell)
+            press = compute_instantaneous_pressure(
+                self._original_energy_fn, sys_i, neighbor, self.kT
+            )
+        else:
+            press = jnp.float32(0.0)
+
+        return ke, pe, temp, etotal, press
+
     def run(
         self,
         R: jnp.ndarray,
@@ -305,6 +358,7 @@ class JAXMDSampler:
         key: Optional[jax.random.PRNGKey] = None,
         neighbor: Optional[Any] = None,
         save_frequency: int = 1,
+        initial_state: Optional[Any] = None,
         **kwargs
     ) -> MDResult:
         """Run MD simulation.
@@ -315,35 +369,58 @@ class JAXMDSampler:
             key: JAX random key. If None, uses a default key.
             neighbor: Optional pre-allocated neighbor list.
             save_frequency: Save trajectory every N steps.
+            initial_state: Optional pre-existing MD state (skips velocity init).
             **kwargs: Additional arguments passed to energy function.
 
         Returns:
-            MDResult namedtuple with final_state, trajectory, and final_neighbors.
+            MDResult namedtuple with final_state, trajectory, final_neighbors,
+            and thermo dict.
         """
-        if key is None:
-            key = random.PRNGKey(0)
-
-        state, neighbor = self.initialize_state(R, key, neighbor)
+        if initial_state is not None:
+            state = initial_state
+            if neighbor is None:
+                neighbor = self.neighbor_fn.allocate(state.position)
+        else:
+            if key is None:
+                key = random.PRNGKey(0)
+            state, neighbor = self.initialize_state(R, key, neighbor)
 
         # Run simulation with lax.scan for efficiency
         def step_fn(carry, _):
             state, neighbor = carry
             new_state = self.apply_fn(state, neighbor=neighbor, **kwargs)
             new_neighbor = self.neighbor_fn.update(new_state.position, neighbor)
-            return (new_state, new_neighbor), new_state.position
 
-        (final_state, final_neighbor), trajectory = jax.lax.scan(
+            ke, pe, temp, etotal, press = self._compute_thermo(new_state, new_neighbor)
+
+            return (new_state, new_neighbor), (new_state.position, ke, pe, temp, etotal, press)
+
+        (final_state, final_neighbor), (trajectory, ke_arr, pe_arr, temp_arr, etotal_arr, press_arr) = jax.lax.scan(
             step_fn, (state, neighbor), jnp.arange(steps)
         )
 
-        # Subsample trajectory if save_frequency > 1
+        # Subsample if save_frequency > 1
         if save_frequency > 1:
             trajectory = trajectory[::save_frequency]
+            ke_arr = ke_arr[::save_frequency]
+            pe_arr = pe_arr[::save_frequency]
+            temp_arr = temp_arr[::save_frequency]
+            etotal_arr = etotal_arr[::save_frequency]
+            press_arr = press_arr[::save_frequency]
+
+        thermo = {
+            'kinetic_energy': ke_arr,
+            'potential_energy': pe_arr,
+            'temperature': temp_arr,
+            'total_energy': etotal_arr,
+            'pressure': press_arr,
+        }
 
         return MDResult(
             final_state=final_state,
             trajectory=trajectory,
             final_neighbors=final_neighbor,
+            thermo=thermo,
         )
 
     def run_with_checkpoints(
@@ -353,6 +430,7 @@ class JAXMDSampler:
         checkpoint_interval: int = 100,
         key: Optional[jax.random.PRNGKey] = None,
         neighbor: Optional[Any] = None,
+        initial_state: Optional[Any] = None,
         **kwargs
     ) -> MDResult:
         """Run MD simulation with gradient checkpointing.
@@ -366,43 +444,58 @@ class JAXMDSampler:
             checkpoint_interval: Number of steps between checkpoints.
             key: JAX random key. If None, uses a default key.
             neighbor: Optional pre-allocated neighbor list.
+            initial_state: Optional pre-existing MD state (skips velocity init).
             **kwargs: Additional arguments passed to energy function.
 
         Returns:
-            MDResult namedtuple with final_state, trajectory, and final_neighbors.
+            MDResult namedtuple with final_state, trajectory, final_neighbors,
+            and thermo dict.
         """
-        if key is None:
-            key = random.PRNGKey(0)
-
-        state, neighbor = self.initialize_state(R, key, neighbor)
+        if initial_state is not None:
+            state = initial_state
+            if neighbor is None:
+                neighbor = self.neighbor_fn.allocate(state.position)
+        else:
+            if key is None:
+                key = random.PRNGKey(0)
+            state, neighbor = self.initialize_state(R, key, neighbor)
 
         # Use remat (gradient checkpointing) for memory efficiency
         @jax.checkpoint
         def checkpoint_block(carry, _):
             state, neighbor = carry
-            # Run checkpoint_interval steps
             def inner_step(inner_carry, __):
                 s, n = inner_carry
                 new_s = self.apply_fn(s, neighbor=n, **kwargs)
                 new_n = self.neighbor_fn.update(new_s.position, n)
-                return (new_s, new_n), new_s.position
+                ke, pe, temp, etotal, press = self._compute_thermo(new_s, new_n)
+                return (new_s, new_n), (new_s.position, ke, pe, temp, etotal, press)
 
-            final_carry, positions = jax.lax.scan(
+            final_carry, outputs = jax.lax.scan(
                 inner_step, (state, neighbor), jnp.arange(checkpoint_interval)
             )
-            return final_carry, positions
+            return final_carry, outputs
 
         num_checkpoints = steps // checkpoint_interval
         remainder = steps % checkpoint_interval
 
         if num_checkpoints > 0:
-            (state, neighbor), trajectory_blocks = jax.lax.scan(
+            (state, neighbor), (traj_blocks, ke_blocks, pe_blocks, temp_blocks, etotal_blocks, press_blocks) = jax.lax.scan(
                 checkpoint_block, (state, neighbor), jnp.arange(num_checkpoints)
             )
-            # Reshape from (num_checkpoints, checkpoint_interval, N, 3) to (total, N, 3)
-            trajectory = trajectory_blocks.reshape(-1, *R.shape)
+            trajectory = traj_blocks.reshape(-1, *R.shape)
+            ke_arr = ke_blocks.reshape(-1)
+            pe_arr = pe_blocks.reshape(-1)
+            temp_arr = temp_blocks.reshape(-1)
+            etotal_arr = etotal_blocks.reshape(-1)
+            press_arr = press_blocks.reshape(-1)
         else:
             trajectory = jnp.empty((0,) + R.shape)
+            ke_arr = jnp.empty((0,))
+            pe_arr = jnp.empty((0,))
+            temp_arr = jnp.empty((0,))
+            etotal_arr = jnp.empty((0,))
+            press_arr = jnp.empty((0,))
 
         # Handle remainder steps
         if remainder > 0:
@@ -410,17 +503,32 @@ class JAXMDSampler:
                 s, n = carry
                 new_s = self.apply_fn(s, neighbor=n, **kwargs)
                 new_n = self.neighbor_fn.update(new_s.position, n)
-                return (new_s, new_n), new_s.position
+                ke, pe, temp, etotal, press = self._compute_thermo(new_s, new_n)
+                return (new_s, new_n), (new_s.position, ke, pe, temp, etotal, press)
 
-            (state, neighbor), remainder_traj = jax.lax.scan(
+            (state, neighbor), (rem_traj, rem_ke, rem_pe, rem_temp, rem_etotal, rem_press) = jax.lax.scan(
                 final_step, (state, neighbor), jnp.arange(remainder)
             )
-            trajectory = jnp.concatenate([trajectory, remainder_traj], axis=0)
+            trajectory = jnp.concatenate([trajectory, rem_traj], axis=0)
+            ke_arr = jnp.concatenate([ke_arr, rem_ke], axis=0)
+            pe_arr = jnp.concatenate([pe_arr, rem_pe], axis=0)
+            temp_arr = jnp.concatenate([temp_arr, rem_temp], axis=0)
+            etotal_arr = jnp.concatenate([etotal_arr, rem_etotal], axis=0)
+            press_arr = jnp.concatenate([press_arr, rem_press], axis=0)
+
+        thermo = {
+            'kinetic_energy': ke_arr,
+            'potential_energy': pe_arr,
+            'temperature': temp_arr,
+            'total_energy': etotal_arr,
+            'pressure': press_arr,
+        }
 
         return MDResult(
             final_state=state,
             trajectory=trajectory,
             final_neighbors=neighbor,
+            thermo=thermo,
         )
 
 

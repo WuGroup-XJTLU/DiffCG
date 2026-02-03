@@ -46,18 +46,14 @@ def vectorized_angle_fn(R_ij, R_kj):
 
 @jit
 def dihedral(R_ab, R_bc, R_cd):
-    """
-    Computes the angle (kj, ij) from vectors R_kj and R_ij, correctly selecting the quadrant.
+    """Compute the dihedral angle for atoms a-b-c-d.
 
-    Based on tan(theta) = |(R_ji x R_kj)| / (R_ji . R_kj). Beware non-differentability of arctan2(0,0).
+    Vectors must point **forward** along the chain:
+      R_ab = pos_b - pos_a  (a→b)
+      R_bc = pos_c - pos_b  (b→c)
+      R_cd = pos_d - pos_c  (c→d)
 
-    Args:
-        R_ij: Vector pointing to i from j
-        R_kj: Vector pointing to k from j
-
-    Returns:
-        Angle between vectors
-
+    Returns the IUPAC dihedral angle in (-π, π].
     """
     cross_ab_bc = jnp.cross(R_ab, R_bc)
     cross_bc_cd = jnp.cross(R_bc, R_cd)

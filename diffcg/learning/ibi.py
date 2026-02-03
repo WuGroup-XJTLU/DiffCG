@@ -66,7 +66,7 @@ class IBIConfig:
 @dataclass
 class IBITargets:
     # Each field is optional; provide dataclass instances used elsewhere in repo
-    # RDF: InterRDFParams with .reference_rdf, .rdf_bin_centers, .rdf_bin_boundaries, .sigma_RDF, .exclude_mask
+    # RDF: InterRDFParams with .reference_rdf, .rdf_bin_centers, .rdf_bin_boundaries, .sigma_RDF, .exclude_pairs
     rdf: Optional[Any] = None
     # BDF/ADF/DDF params carry bin centers/boundaries and topology arrays
     bdf: Optional[Any] = None
@@ -109,8 +109,7 @@ class IterativeBoltzmannInversion:
         system: Optional[AtomicSystem] = None,
         targets: IBITargets,
         config: IBIConfig,
-        mask_topology: Optional[jnp.ndarray] = None,
-        max_num_atoms: Optional[int] = None,
+        custom_mask_function=None,
         initial_tables: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.kBT = float(kBT)
@@ -129,8 +128,7 @@ class IterativeBoltzmannInversion:
 
         self.targets = targets
         self.cfg = config
-        self.mask_topology = mask_topology
-        self.max_num_atoms = max_num_atoms
+        self.custom_mask_function = custom_mask_function
 
         # Initialize tabulated x-grids and potentials from targets
         self.x_pair: Optional[jnp.ndarray] = None
@@ -223,8 +221,6 @@ class IterativeBoltzmannInversion:
                 self._pair_y_with_cutoff_shift(self.U_pair),
                 self.cfg.r_onset,
                 self.cfg.r_cut,
-                mask_topology=self.mask_topology,
-                max_num_atoms=self.max_num_atoms,
             ).get_energy_fn()
             energy_fns.append(pair_term)
 
@@ -280,13 +276,21 @@ class IterativeBoltzmannInversion:
     def _create_md_equ(self, step: int, start_system: AtomicSystem, energy_fn: Callable):
         return create_equilibration_run(
             start_system, energy_fn, self.cfg.sampler_params, self.cfg.r_cut,
+            custom_mask_function=self.custom_mask_function,
+            sampler_backend=getattr(self.cfg, 'sampler_backend', 'jaxmd'),
+            lammps_config=getattr(self.cfg, 'lammps_config', None),
         )
 
-    def _create_md_prd(self, step: int, start_system: AtomicSystem, energy_fn: Callable):
+    def _create_md_prd(self, step: int, start_system: AtomicSystem, energy_fn: Callable,
+                        restart_state=None):
         return create_production_run(
             start_system, energy_fn, self.cfg.sampler_params, self.cfg.r_cut,
             trajectory=f"{self.cfg.trajectory_prefix}{step}.traj",
             logfile=f"{self.cfg.logfile_prefix}{step}.log",
+            custom_mask_function=self.custom_mask_function,
+            sampler_backend=getattr(self.cfg, 'sampler_backend', 'jaxmd'),
+            lammps_config=getattr(self.cfg, 'lammps_config', None),
+            restart_state=restart_state,
         )
 
     # Observables
@@ -336,7 +340,18 @@ class IterativeBoltzmannInversion:
 
         md_equ = self._create_md_equ(step_idx, self.system, energy_fn)
         md_equ.run(scheme["equilibration_steps"])
-        md_prod = self._create_md_prd(step_idx, md_equ.get_final_system(), energy_fn)
+
+        _backend = getattr(self.cfg, 'sampler_backend', 'jaxmd')
+        if _backend == 'lammps':
+            restart_state = {'restart_file': md_equ.get_restart_file()}
+        else:
+            restart_state = {
+                'state': md_equ.get_final_state(),
+                'neighbor': md_equ.get_final_neighbors(),
+            }
+
+        md_prod = self._create_md_prd(step_idx, md_equ.get_final_system(), energy_fn,
+                                       restart_state=restart_state)
         md_prod.run(scheme["production_steps"])
 
         traj = md_prod.get_trajectory()

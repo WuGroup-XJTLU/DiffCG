@@ -119,19 +119,30 @@ def init_relative_entropy(
     max_num_atoms = init_system.n_atoms
 
     r_cut = state.get('r_cut', 1.0)
+    _custom_mask_function = state.get('custom_mask_function', None)
+
+    _sampler_backend = state.get('sampler_backend', 'jaxmd')
+    _lammps_config = state.get('lammps_config', None)
 
     def create_md_equ(step, start_system, sample_energy_fn):
         return create_equilibration_run(
             start_system, sample_energy_fn, state['sampler_params'], r_cut,
+            custom_mask_function=_custom_mask_function,
+            sampler_backend=_sampler_backend,
+            lammps_config=_lammps_config,
         )
 
-    def create_md_prd(step, start_system, sample_energy_fn):
+    def create_md_prd(step, start_system, sample_energy_fn, restart_state=None):
         sampler_params = state['sampler_params']
         return create_production_run(
             start_system, sample_energy_fn, sampler_params, r_cut,
             trajectory=f"{sampler_params['trajectory']}{step}.npz",
             logfile=f"{sampler_params['logfile']}{step}.log",
             loginterval=sampler_params['loginterval'],
+            custom_mask_function=_custom_mask_function,
+            sampler_backend=_sampler_backend,
+            lammps_config=_lammps_config,
+            restart_state=restart_state,
         )
 
     def rerun_energy(params, traj: Trajectory):
@@ -157,7 +168,17 @@ def init_relative_entropy(
         if step == 0:
             md_equ = create_md_equ(step, init_system, sample_energy_fn)
             md_equ.run(scheme['equilibration_steps'])
-            md_prod = create_md_prd(step, md_equ.get_final_system(), sample_energy_fn)
+
+            if _sampler_backend == 'lammps':
+                _restart_state = {'restart_file': md_equ.get_restart_file()}
+            else:
+                _restart_state = {
+                    'state': md_equ.get_final_state(),
+                    'neighbor': md_equ.get_final_neighbors(),
+                }
+
+            md_prod = create_md_prd(step, md_equ.get_final_system(), sample_energy_fn,
+                                    restart_state=_restart_state)
             md_prod.run(scheme['production_steps'])
             trajs_cg = md_prod.get_trajectory()
         else:
@@ -192,6 +213,7 @@ def init_relative_entropy(
                 cell=sys0.cell,
                 cutoff=state.get('r_cut', 1.0),
                 capacity_multiplier=1.5,
+                custom_mask_function=_custom_mask_function,
             )
             neighbors_list = [neighbors0]
             for i in range(1, batch_size):
@@ -260,7 +282,17 @@ def init_relative_entropy(
                     p.unlink()
             md_equ = create_md_equ(step, init_system, sample_energy_fn)
             md_equ.run(scheme['equilibration_steps'])
-            md_prod = create_md_prd(step, md_equ.get_final_system(), sample_energy_fn)
+
+            if _sampler_backend == 'lammps':
+                _restart_state = {'restart_file': md_equ.get_restart_file()}
+            else:
+                _restart_state = {
+                    'state': md_equ.get_final_state(),
+                    'neighbor': md_equ.get_final_neighbors(),
+                }
+
+            md_prod = create_md_prd(step, md_equ.get_final_system(), sample_energy_fn,
+                                    restart_state=_restart_state)
             md_prod.run(scheme['production_steps'])
 
         # Placeholder loss; compute actual RE loss if needed

@@ -10,15 +10,16 @@ import os
 import numpy as np
 import jax.numpy as jnp
 import pandas as pd
-from jax.tree_util import tree_map
 from scipy import interpolate as sci_interpolate
 
 from diffcg import energy
+from diffcg._core.neighborlist import make_exclusion_mask
 from diffcg.system import AtomicSystem
 from diffcg.io.lammps import read_lammps_data
 from diffcg.io.ase_trj import read_ase_trj
 from diffcg.observable.structure import (
     initialize_inter_radial_distribution_fun,
+    initialize_inter_rdf_neighborlist_fun,
     initialize_angle_distribution_fun,
     initialize_bond_distribution_fun,
     initialize_dihedral_distribution_fun,
@@ -30,8 +31,8 @@ from diffcg.observable.structure import (
     adf_discretization,
     ddf_discretization,
     rdf_discretization,
+    exclusion_pairs_from_topology,
 )
-from diffcg.observable.analyze import TrajectoryAnalyzer
 from diffcg._core.constants import BOLTZMANN_KJMOLK, PRESSURE_CONVERSION_KJMOL_NM3_TO_BAR
 
 # ---------------------------------------------------------------------------
@@ -117,17 +118,13 @@ def load_targets(temp, num_beads=NUM_BEADS):
     dihedral_top = load_topology_csv(os.path.join(DATA_DIR, "polymer", "dihedral.csv"))
     ddf_struct = DDFParams(reference_ddf, ddf_bin_centers, ddf_bin_boundaries, sigma_DDF, dihedral_top)
 
-    # RDF (with exclusion mask from dihedral topology)
+    # RDF (with exclusion pairs from topology — excludes 1-2, 1-3, 1-4 interactions)
     rdf_bin_centers, rdf_bin_boundaries, sigma_RDF = rdf_discretization(RDF_cut=R_CUT)
-    mask = np.ones((num_beads, num_beads))
-    for i, j in [(0, 1), (1, 0), (2, 0), (0, 2), (3, 0), (0, 3),
-                 (2, 1), (1, 2), (3, 1), (1, 3), (3, 2), (2, 3)]:
-        mask[dihedral_top[:, i], dihedral_top[:, j]] = 0
-    polymer_exclude = jnp.array(mask)
+    exclude_pairs = exclusion_pairs_from_topology(topology, exclusion_level=4)
 
     rdf_path = os.path.join(DATA_DIR, f"T{temp}", "nb_smoothed.dist.tgt")
     reference_rdf = load_curve_csv(rdf_path, rdf_bin_centers, zero_eps=0.0)
-    rdf_struct = InterRDFParams(reference_rdf, rdf_bin_centers, rdf_bin_boundaries, sigma_RDF, polymer_exclude)
+    rdf_struct = InterRDFParams(reference_rdf, rdf_bin_centers, rdf_bin_boundaries, sigma_RDF, exclude_pairs)
 
     target_dict = {
         "rdf": rdf_struct,
@@ -176,10 +173,10 @@ def load_pretrained_params():
 # ---------------------------------------------------------------------------
 # Quantity dict & observable helpers
 # ---------------------------------------------------------------------------
-_DEFAULT_GAMMAS = {"rdf": 1.0, "bdf": 1e-3, "adf": 0.1, "ddf": 1.0}
+_DEFAULT_GAMMAS = {"rdf": 1.0, "bdf": 1e-3, "adf": 0.1, "ddf": 1.0, "pressure": 10.0}
 
 
-def build_quantity_dict(target_dict, gammas=None):
+def build_quantity_dict(target_dict, gammas=None, kT=None):
     """Build quantity_dict from target distributions.
 
     Parameters
@@ -187,6 +184,9 @@ def build_quantity_dict(target_dict, gammas=None):
     target_dict : dict  from ``load_targets``
     gammas : dict, optional
         Per-observable loss weights. Defaults to ``_DEFAULT_GAMMAS``.
+    kT : float, optional
+        Thermal energy in kJ/mol (= kB * T). Required when ``"pressure"``
+        is in *target_dict*.
     """
     gammas = gammas or _DEFAULT_GAMMAS
     quantity_dict = {}
@@ -219,12 +219,29 @@ def build_quantity_dict(target_dict, gammas=None):
             "compute_fn": fn, "target": s.reference_ddf,
             "gamma": gammas.get("ddf", 1.0), "bin_centers": s.ddf_bin_centers,
         }
+    if "pressure" in target_dict:
+        from diffcg.observable.pressure import make_pressure_compute_fn
+        if kT is None:
+            raise ValueError("kT is required when 'pressure' is in target_dict")
+        quantity_dict["pressure"] = {
+            "compute_fn": make_pressure_compute_fn(kT),
+            "target": jnp.atleast_1d(jnp.array(target_dict["pressure"])),
+            "gamma": gammas.get("pressure", 10.0),
+        }
     return quantity_dict
 
 
-def build_energy_fn(params, topology, max_num_atoms=1,
-                    atom_types=None, pair_type_map=None):
+def build_exclusion_mask(topology, exclusion_level=3):
+    """Build a custom_mask_function from topology for neighbor list exclusions."""
+    return make_exclusion_mask(topology, exclusion_level=exclusion_level)
+
+
+def build_energy_fn(params, topology, atom_types=None, pair_type_map=None,
+                    **_unused):
     """Construct a total energy function from spline parameters.
+
+    Bonded-pair exclusions are now handled at the neighbor list level
+    via ``build_exclusion_mask``, not inside energy classes.
 
     When *atom_types* and *pair_type_map* are provided the pair (and
     repulsion prior) terms use per-type interactions.
@@ -233,7 +250,7 @@ def build_energy_fn(params, topology, max_num_atoms=1,
     angle_top = topology["angle"]
     dihedral_top = topology["dihedral"]
 
-    pair_kw = dict(mask_topology=angle_top, max_num_atoms=max_num_atoms)
+    pair_kw = {}
     if atom_types is not None and pair_type_map is not None:
         pair_kw.update(atom_types=atom_types, pair_type_map=pair_type_map)
 
@@ -266,19 +283,3 @@ def build_energy_fn(params, topology, max_num_atoms=1,
     return total_energy_fn
 
 
-def make_calculate_observables_fn(quantity_dict, ref_system):
-    """Return a callable that computes observables from a trajectory or batched systems."""
-
-    def calculate_observables(traj_file="sample.traj", batched_systems=None):
-        if batched_systems is None:
-            systems = read_ase_trj(traj_file)
-            batched_systems = tree_map(lambda *xs: jnp.stack(xs), *systems)
-
-        observables = {}
-        for key in ("rdf", "bdf", "adf", "ddf"):
-            if key in quantity_dict:
-                analyzer = TrajectoryAnalyzer(quantity_dict[key]["compute_fn"], ref_system)
-                observables[key] = analyzer.analyze(batched_systems)
-        return observables
-
-    return calculate_observables

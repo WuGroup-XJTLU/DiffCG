@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 from jax.tree_util import tree_map
 
-from diffcg._core.periodic import make_displacement
+from diffcg._core.periodic import get_displacement_fn
 
 
 # ---------------------------------------------------------------------------
@@ -301,4 +301,4 @@ def unwrap_positions(R_wrapped: jnp.ndarray, R_ref: jnp.ndarray, cell: jnp.ndarr
 # ---------------------------------------------------------------------------
 
 def to_displacement(system):
-    return make_displacement(system.cell)
+    return get_displacement_fn(system.cell)

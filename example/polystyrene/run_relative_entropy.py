@@ -21,7 +21,7 @@ from diffcg.system import from_ase_atoms
 from diffcg.learning.relative_entropy import init_relative_entropy, optimize_relative_entropy
 
 from common import (
-    load_targets, load_pretrained_params, build_energy_fn,
+    load_targets, load_pretrained_params, build_energy_fn, build_exclusion_mask,
     R_CUT, BOLTZMANN_CONSTANT,
 )
 
@@ -39,9 +39,13 @@ init_system = from_ase_atoms(ase_read(ref_traj, index=0))
 pretrained_params = load_pretrained_params()
 
 
+# ── Exclusion mask ────────────────────────────────────────────────────
+custom_mask_function = build_exclusion_mask(topology, exclusion_level=3)
+
+
 # ── Energy builder ─────────────────────────────────────────────────────
 def build_energy_fn_with_params(params, max_num_atoms=1):
-    return build_energy_fn(params, topology, max_num_atoms=max_num_atoms)
+    return build_energy_fn(params, topology)
 
 
 # ── Optimizer ──────────────────────────────────────────────────────────
@@ -70,6 +74,7 @@ state = {
     "r_cut": R_CUT,
     "sampler_params": sampler_params,
     "sim_time_scheme": sim_time_scheme,
+    "custom_mask_function": custom_mask_function,
 }
 
 update_fn = init_relative_entropy(

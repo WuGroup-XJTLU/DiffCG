@@ -2,7 +2,7 @@
 # Copyright (c) 2025 WuResearchGroup
 
 from functools import partial
-from typing import Callable, Dict
+from typing import Callable, Dict, Optional
 import jax.numpy as jnp
 import numpy as np
 from jax import grad
@@ -27,6 +27,7 @@ def compute_energy(
     capacity_multiplier: float = 1.25,
     neighbors=None,
     spatial_partitioning=None,
+    custom_mask_function: Optional[Callable] = None,
     **kwargs,
 ) -> jnp.ndarray:
     """Compute energy for an AtomicSystem.
@@ -48,6 +49,7 @@ def compute_energy(
             cell=system.cell,
             cutoff=cutoff,
             capacity_multiplier=capacity_multiplier,
+            custom_mask_function=custom_mask_function,
         )
 
     neighbors = spatial_partitioning.neighbor_fn.update(system.R, neighbors)
@@ -65,6 +67,7 @@ def compute_energy_and_forces(
     capacity_multiplier: float = 1.25,
     neighbors=None,
     spatial_partitioning=None,
+    custom_mask_function: Optional[Callable] = None,
     **kwargs,
 ) -> Dict[str, jnp.ndarray]:
     """Compute energy and forces for an AtomicSystem.
@@ -86,6 +89,7 @@ def compute_energy_and_forces(
             cell=system.cell,
             cutoff=cutoff,
             capacity_multiplier=capacity_multiplier,
+            custom_mask_function=custom_mask_function,
         )
 
     neighbors = spatial_partitioning.neighbor_fn.update(system.R, neighbors)
@@ -106,7 +110,8 @@ def compute_energy_and_forces(
     return {'energy': energy, 'forces': forces}
 
 
-def init_energy_calculator(energy_fn, cutoff=1.0, capacity_multiplier=1.25, dtype=jnp.float64):
+def init_energy_calculator(energy_fn, cutoff=1.0, capacity_multiplier=1.25, dtype=jnp.float64,
+                           custom_mask_function=None):
     """Create a function that computes energy for a System (no ASE dependency)."""
 
     def calculate_fn(system, **kwargs):
@@ -117,6 +122,7 @@ def init_energy_calculator(energy_fn, cutoff=1.0, capacity_multiplier=1.25, dtyp
             cell=cell,
             cutoff=cutoff,
             capacity_multiplier=capacity_multiplier,
+            custom_mask_function=custom_mask_function,
         )
         return energy_fn(system, neighbors, **kwargs)
 

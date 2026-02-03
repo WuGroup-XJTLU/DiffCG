@@ -176,9 +176,15 @@ class LAMMPSDataReader:
                 header_info['dihedrals_end'] = len(lines)
                 break
         
-        # If no bonds/angles/dihedrals sections were found, set atoms_end to end of file
+        # Set end markers for the last section present to end of file
         if header_info['atoms_end'] == 0:
             header_info['atoms_end'] = len(lines)
+        if header_info['n_bonds'] > 0 and header_info['bonds_end'] == 0:
+            header_info['bonds_end'] = len(lines)
+        if header_info['n_angles'] > 0 and header_info['angles_end'] == 0:
+            header_info['angles_end'] = len(lines)
+        if header_info['n_dihedrals'] > 0 and header_info['dihedrals_end'] == 0:
+            header_info['dihedrals_end'] = len(lines)
         
         # Generate atom names and counts (will be updated when parsing atoms)
         header_info['atom_names'] = [f'Type_{i+1}' for i in range(header_info['n_atom_types'])]
@@ -200,27 +206,31 @@ class LAMMPSDataReader:
         return masses
     
     def _parse_atoms(self, lines: List[str], start: int, end: int) -> Dict:
-        """Parse the atoms section."""
-        coords = []
-        types = []
+        """Parse the atoms section, sorting by atom ID."""
+        atoms = []
         atom_type_count = {}
-        
+
         for i in range(start, end):
             line = lines[i].strip()
             if line and not line.startswith('#'):
                 parts = line.split()
-                if len(parts) == 7:  # atom_id, mol_id, atom_type, x, y, z
+                if len(parts) >= 7:  # atom_id, mol_id, atom_type, charge, x, y, z [ix iy iz]
+                    atom_id = int(parts[0])
                     atom_type = int(parts[2])
                     x, y, z = float(parts[4]), float(parts[5]), float(parts[6])
-                    
-                    coords.append([x, y, z])
-                    types.append(atom_type - 1)  # Convert to 0-based indexing
-                    
+
+                    atoms.append((atom_id, atom_type - 1, x, y, z))
                     atom_type_count[atom_type] = atom_type_count.get(atom_type, 0) + 1
-        
+
+        # Sort by atom ID to ensure consistent ordering
+        atoms.sort(key=lambda a: a[0])
+
+        coords = np.array([[a[2], a[3], a[4]] for a in atoms])
+        types = np.array([a[1] for a in atoms])
+
         return {
-            'coords': np.array(coords),
-            'types': np.array(types),
+            'coords': coords,
+            'types': types,
             'atom_type_count': atom_type_count
         }
     
@@ -449,21 +459,26 @@ class LAMMPSDumpReader:
         return cell
     
     def _parse_frame_atoms(self, lines: List[str], n_atoms: int) -> Dict:
-        """Parse atoms section from frame."""
+        """Parse atoms section from frame.
+
+        LAMMPS dump files may have atoms in arbitrary order, so we sort
+        by atom_id to guarantee consistent indexing.
+        """
+        atom_ids = []
         coords = []
         types = []
         atom_type_count = {}
-        
+
         # Find the atoms section
         atoms_start = None
         for i, line in enumerate(lines):
             if 'ITEM: ATOMS' in line:
                 atoms_start = i + 1
                 break
-        
+
         if atoms_start is None:
             raise ValueError("Could not find atoms section in frame")
-        
+
         # Parse atom lines
         for i in range(atoms_start, atoms_start + n_atoms):
             if i < len(lines):
@@ -474,19 +489,25 @@ class LAMMPSDumpReader:
                         atom_id = int(parts[0])
                         atom_type = int(parts[1])
                         x, y, z = float(parts[2]), float(parts[3]), float(parts[4])
-                        
+
+                        atom_ids.append(atom_id)
                         coords.append([x, y, z])
                         types.append(atom_type - 1)  # Convert to 0-based indexing
-                        
+
                         atom_type_count[atom_type] = atom_type_count.get(atom_type, 0) + 1
-        
+
+        # Sort by atom_id to ensure consistent ordering
+        sort_order = np.argsort(atom_ids)
+        coords = np.array(coords)[sort_order]
+        types = np.array(types)[sort_order]
+
         # Generate atom names and counts
         atom_names = [f'Type_{i+1}' for i in range(max(atom_type_count.keys()) if atom_type_count else 0)]
         atom_numbs = [atom_type_count.get(i+1, 0) for i in range(len(atom_names))]
-        
+
         return {
-            'coords': np.array(coords),
-            'types': np.array(types),
+            'coords': coords,
+            'types': types,
             'atom_names': atom_names,
             'atom_numbs': atom_numbs
         }

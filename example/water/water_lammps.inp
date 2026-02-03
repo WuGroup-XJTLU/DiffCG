@@ -1,0 +1,62 @@
+# Unit system: real, LJ, metal etc., check details on LAMMPS doc
+units      real
+
+# Dimension of your simulation box
+dimension  3
+
+# Boundary condition: 
+# p: periodic boundary condition (PBC)
+boundary   p p p
+
+# Format for your data file
+atom_style full
+
+# Read system data such as number of atoms, number of covalent bonds,
+# atomic informations, coordinates etc.
+read_data SPCE_water.data
+
+
+pair_style lj/cut/coul/long 10.0 10.0
+
+pair_coeff 2 2 0.1502629 3.1169
+pair_coeff 1 2 0.0341116368 2.04845
+pair_coeff 1 1 0.00774378 0.98
+
+bond_style  harmonic
+bond_coeff  1 176.864 0.9611
+
+angle_style harmonic
+angle_coeff 1 42.1845 109.4712
+
+kspace_style pppm 1.0e-5
+
+
+variable Dt equal 0.5e0
+
+variable T equal 293.15
+variable Tdamp equal 100*${Dt}
+
+velocity all create $T 12345689 dist uniform
+
+variable P equal 1.0
+variable Pdamp equal 1000*${Dt}
+
+timestep ${Dt}
+
+fix 1 all npt temp $T $T ${Tdamp} iso $P $P ${Pdamp}
+fix 2 all recenter 0.5 0.5 0.5 units fraction
+
+neighbor 2.0 bin
+neigh_modify delay 0 every 10 check yes
+
+thermo      100
+thermo_style custom step temp press vol
+thermo_modify norm no flush yes
+
+compute adfcompute all adf 361 2 2 2 0.5 3.5 0.5 3.5
+fix 3 all ave/time 500 200 100000 c_adfcompute[*] file oxygen.adf mode vector
+
+dump            2 all custom 500 water.dump id type xu yu zu
+dump_modify     2 sort id
+
+run 100000

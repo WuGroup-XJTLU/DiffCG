@@ -10,6 +10,7 @@ from .sample import (
     create_production_run,
 )
 from .jaxmd_sampler import JAXMDSampler, create_jaxmd_sampler
+from .lammps_sampler import LAMMPSSampler
 
 __all__ = [
     "compute_energy",
@@ -22,4 +23,5 @@ __all__ = [
     "create_production_run",
     "JAXMDSampler",
     "create_jaxmd_sampler",
+    "LAMMPSSampler",
 ]

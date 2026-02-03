@@ -2,16 +2,19 @@
 # Copyright (c) 2025 WuResearchGroup
 
 """Custom definition of some potential energy functions."""
-from typing import Callable
+from typing import Callable, Dict, List, Optional
 
+import numpy as np
 import jax.numpy as jnp
 from functools import partial,wraps
 from jax import vmap
 import jax
 from diffcg._core import interpolate as custom_interpolate
 from diffcg._core.geometry import distance, vectorized_angle_fn, vectorized_dihedral_fn
-from diffcg._core.periodic import make_displacement_with_cached_inverse
+from diffcg._core.periodic import get_displacement_fn
 from diffcg._core.math import high_precision_sum
+from diffcg._core.units import NM_TO_ANGSTROM, KJMOL_TO_KCALMOL, RAD_TO_DEG
+from jax_md import space, partition
 
 def tabulated(dr: jnp.ndarray, spline: Callable[[jnp.ndarray], jnp.ndarray], **unused_kwargs
               ) -> jnp.ndarray:
@@ -111,6 +114,85 @@ def generic_repulsion(dr,
     return U
 
 
+def lj(dr, sigma=1.0, epsilon=1.0, **dynamic_kwargs):
+    """Lennard-Jones 12-6 potential: U = 4*epsilon*[(sigma/r)^12 - (sigma/r)^6].
+
+    Ref: lammps/src/pair_lj_cut.cpp lines 116-129.
+
+    Args:
+      dr: Pairwise distances.
+      sigma: Length scale where potential crosses zero.
+      epsilon: Depth of the potential well.
+
+    Returns:
+      Array of energies.
+    """
+    dr = jnp.where(dr > 1.e-8, dr, 1.e8)
+    idr = sigma / dr
+    idr6 = idr ** 6
+    return 4.0 * epsilon * (idr6 * idr6 - idr6)
+
+
+def soft(dr, A=1.0, r_cutoff=1.0, **dynamic_kwargs):
+    """Soft cosine potential: U = A*(1 + cos(pi*r/r_cutoff)).
+
+    Ref: lammps/src/pair_soft.cpp lines 102-116.
+
+    Args:
+      dr: Pairwise distances.
+      A: Prefactor (energy scale).
+      r_cutoff: Cutoff distance (potential is zero at r_cutoff).
+
+    Returns:
+      Array of energies.
+    """
+    return A * (1.0 + jnp.cos(jnp.pi * dr / r_cutoff))
+
+
+def morse(dr, D=1.0, alpha=1.0, r0=1.0, **dynamic_kwargs):
+    """Morse potential: U = D*(exp(-2*alpha*(r-r0)) - 2*exp(-alpha*(r-r0))).
+
+    Ref: lammps/src/pair_morse.cpp lines 105-117.
+    Minimum = -D at r = r0.
+
+    Args:
+      dr: Pairwise distances.
+      D: Well depth.
+      alpha: Width parameter.
+      r0: Equilibrium distance.
+
+    Returns:
+      Array of energies.
+    """
+    dexp = jnp.exp(-alpha * (dr - r0))
+    return D * (dexp * dexp - 2.0 * dexp)
+
+
+def mie(dr, sigma=1.0, epsilon=1.0, gamma_r=12.0, gamma_a=6.0, **dynamic_kwargs):
+    """Mie (generalized LJ) potential.
+
+    U = C*epsilon*[(sigma/r)^gamma_r - (sigma/r)^gamma_a]
+    where C = (gamma_r/(gamma_r-gamma_a)) * (gamma_r/gamma_a)^(gamma_a/(gamma_r-gamma_a)).
+
+    Ref: lammps/src/EXTRA-PAIR/pair_mie_cut.cpp lines 118-132, 536-541.
+    Reduces to LJ when gamma_r=12, gamma_a=6 (C=4).
+
+    Args:
+      dr: Pairwise distances.
+      sigma: Length scale.
+      epsilon: Energy scale (well depth).
+      gamma_r: Repulsive exponent.
+      gamma_a: Attractive exponent.
+
+    Returns:
+      Array of energies.
+    """
+    dr = jnp.where(dr > 1.e-8, dr, 1.e8)
+    C = (gamma_r / (gamma_r - gamma_a)) * (gamma_r / gamma_a) ** (gamma_a / (gamma_r - gamma_a))
+    idr = sigma / dr
+    return C * epsilon * (idr ** gamma_r - idr ** gamma_a)
+
+
 def simple_spring(dr,
                   length=1,
                   epsilon=1,
@@ -170,148 +252,75 @@ def build_pair_type_map(n_atom_types):
     return pair_map, n_pair_types
 
 
-def build_bonded_pair_set(topology):
-    """Pre-compute set of bonded atom pairs for O(1) lookup.
-
-    Extracts all unique pairs of atoms that are bonded through the topology
-    (bonds, angles, or dihedrals) and returns them as a sorted array for
-    efficient lookup via searchsorted.
+def compute_pair_distances(positions, neighbors, disp_fn):
+    """Compute pairwise distances from neighbor list (Dense or Sparse).
 
     Args:
-        topology: (num_entries, n_cols) array where n_cols is 2, 3, or 4
-                  for bonds, angles, or dihedrals respectively.
+        positions: (N, D) particle positions.
+        neighbors: JAX-MD neighbor list object.
+        disp_fn: JAX-MD displacement function.
 
     Returns:
-        bonded_pairs: (num_pairs, 2) int32 array of sorted (min, max) pairs
+        Tuple of (dr, dR, mask, normalization, type_i_idx, type_j_idx) where:
+          - dr: pairwise distances (eps-safe)
+          - dR: displacement vectors
+          - mask: boolean mask for valid (non-padding) entries
+          - normalization: 2.0 for Dense/Sparse (double-counted), 1.0 for OrderedSparse
+          - type_i_idx: center atom indices (for per-type lookups)
+          - type_j_idx: neighbor atom indices (for per-type lookups)
     """
-    n_cols = topology.shape[1]
-    pairs_list = []
+    N = positions.shape[0]
 
-    # Extract all pairs within each topology entry
-    for i in range(n_cols):
-        for j in range(i + 1, n_cols):
-            # Stack pairs as (atom_i, atom_j) for each topology row
-            col_i = topology[:, i]
-            col_j = topology[:, j]
-            # Normalize: smaller index first
-            pair_min = jnp.minimum(col_i, col_j)
-            pair_max = jnp.maximum(col_i, col_j)
-            pairs_list.append(jnp.stack([pair_min, pair_max], axis=1))
+    if partition.is_sparse(neighbors.format):
+        # Sparse/OrderedSparse: neighbors.idx has shape [2, max_pairs]
+        d = space.map_bond(disp_fn)
+        safe_0 = jnp.minimum(neighbors.idx[0], N - 1)
+        safe_1 = jnp.minimum(neighbors.idx[1], N - 1)
+        dR = d(positions[safe_0], positions[safe_1])
+        dr = vmap(distance)(dR)
+        mask = neighbors.idx[0] < N
+        normalization = 1.0 if neighbors.format is partition.NeighborListFormat.OrderedSparse else 2.0
+        type_i_idx = safe_0
+        type_j_idx = safe_1
+    else:
+        # Dense: neighbors.idx has shape [N, max_nbrs]
+        idx = neighbors.idx
+        safe_idx = jnp.minimum(idx, N - 1)
+        R_neigh = positions[safe_idx]          # [N, max_nbrs, D]
+        d = space.map_neighbor(disp_fn)
+        dR = d(positions, R_neigh)             # [N, max_nbrs, D]
+        dr = vmap(vmap(distance))(dR)          # [N, max_nbrs]
+        mask = idx < N
+        normalization = 2.0
+        type_i_idx = jnp.arange(N)[:, None]   # [N, 1] broadcasts with [N, max_nbrs]
+        type_j_idx = safe_idx                  # [N, max_nbrs]
 
-    # Concatenate all pairs
-    all_pairs = jnp.concatenate(pairs_list, axis=0)
-
-    # Remove duplicates by using unique on a combined key
-    # Encode pairs as single integers for unique operation
-    max_atom = jnp.max(all_pairs) + 1
-    pair_keys = all_pairs[:, 0] * max_atom + all_pairs[:, 1]
-    unique_keys = jnp.unique(pair_keys)
-
-    # Decode back to pairs
-    unique_pairs = jnp.stack([unique_keys // max_atom, unique_keys % max_atom], axis=1)
-    return unique_pairs.astype(jnp.int32)
-
-
-def mask_bonded_neighbors(idx, topology, max_num_atoms, bonded_pairs=None):
-    """
-    Mask neighbor pairs that are bonded through topology interactions.
-
-    This function identifies pairs of atoms that are bonded through topology
-    interactions and masks them by setting their indices to max_num_atoms.
-    This prevents double-counting of interactions between bonded atoms.
-
-    Args:
-        idx: Tuple of (i_indices, j_indices) for neighbor pairs
-        topology: (num_entries, n_cols) array of topology definitions
-        max_num_atoms (int): Maximum number of atoms, used as mask value
-        bonded_pairs: Optional pre-computed bonded pairs from build_bonded_pair_set().
-                      If None, will be computed on-the-fly.
-
-    Returns:
-        Tuple of (i_masked, j_masked) with bonded pairs masked to max_num_atoms
-    """
-    i = idx[0]  # (num_pairs,) - first atom in each pair
-    j = idx[1]  # (num_pairs,) - second atom in each pair
-
-    # Build bonded pairs if not provided
-    if bonded_pairs is None:
-        bonded_pairs = build_bonded_pair_set(topology)
-
-    # Normalize input pairs (smaller index first)
-    pair_min = jnp.minimum(i, j)
-    pair_max = jnp.maximum(i, j)
-
-    # Encode pairs as single integers for lookup
-    max_atom = jnp.maximum(jnp.max(bonded_pairs) + 1, max_num_atoms + 1)
-    query_keys = pair_min * max_atom + pair_max
-    bonded_keys = bonded_pairs[:, 0] * max_atom + bonded_pairs[:, 1]
-
-    # Sort bonded_keys for searchsorted
-    sorted_indices = jnp.argsort(bonded_keys)
-    sorted_bonded_keys = bonded_keys[sorted_indices]
-
-    # Use searchsorted to find potential matches
-    insert_indices = jnp.searchsorted(sorted_bonded_keys, query_keys)
-
-    # Check if the found index actually matches (handles boundary cases)
-    insert_indices_safe = jnp.minimum(insert_indices, len(sorted_bonded_keys) - 1)
-    bonded_mask = sorted_bonded_keys[insert_indices_safe] == query_keys
-
-    # Set both i and j to max_num_atoms if bonded, else keep original
-    i_masked = jnp.where(bonded_mask, max_num_atoms, i)
-    j_masked = jnp.where(bonded_mask, max_num_atoms, j)
-    return i_masked, j_masked
-
-
-def _get_edge_list_from_jaxmd_neighbors(neighbors):
-    """Convert JAX-MD Dense neighbor list to edge-list format.
-
-    IMPORTANT: This function expects Dense format with shape [N, max_neighbors_per_particle].
-    If using JAX-MD partition.Sparse format (shape [2, max_neighbors]), this will fail!
-
-    JAX-MD Dense format: neighbors.idx with shape [N, max_neighbors_per_particle]
-      - idx[i, j] = j-th neighbor of particle i
-      - Padding value = N for unused slots
-
-    Args:
-        neighbors: JAX-MD neighbor list object with .idx attribute (Dense format required)
-
-    Returns:
-        Tuple of (centers, others, N) where:
-          - centers: 1D array of center atom indices
-          - others: 1D array of neighbor atom indices
-          - N: Number of particles (from neighbor list)
-
-    Raises:
-        AssertionError: If neighbor list appears to be in wrong format (N < 10 suggests Sparse format)
-    """
-    idx = neighbors.idx
-    N = idx.shape[0]
-    max_neighbors = idx.shape[1]
-
-    # Sanity check: If N == 2 and max_neighbors > N, likely using wrong format (Sparse has shape (2, total_pairs))
-    # Dense format should have N = number of particles, max_neighbors = capacity per particle
-    # Sparse format has N = 2 (for i,j pairs), max_neighbors = total number of pairs
-    if N == 2 and max_neighbors > 100:
-        raise AssertionError(
-            f"Neighbor list has suspicious shape ({N}, {max_neighbors}). "
-            f"This looks like partition.Sparse format (shape (2, num_pairs)). "
-            f"This function requires Dense format with shape (N_particles, max_neighbors_per_particle). "
-            f"Change neighbor list format to partition.Dense in jaxmd_sampler.py"
-        )
-
-    centers = jnp.repeat(jnp.arange(N), max_neighbors)
-    others = idx.flatten()
-    return centers, others, N
+    return dr, dR, mask, normalization, type_i_idx, type_j_idx
 
 
 class TabulatedBondEnergy:
+    interaction_type = "bond"
+
     def __init__(self, x_vals, y_vals, bonds, bond_types=None):
         self.x_vals = x_vals
         self.y_vals = jnp.atleast_2d(jnp.asarray(y_vals))  # (N_types, N_grid)
         self.bonds = bonds
         self.bond_types = bond_types
         self.n_types = self.y_vals.shape[0]
+
+    def to_lammps(self, n_points=500):
+        x = np.linspace(float(self.x_vals[0]), float(self.x_vals[-1]), n_points)
+        tables = []
+        for i in range(self.n_types):
+            sp = custom_interpolate.MonotonicInterpolate(self.x_vals, self.y_vals[i])
+            y = np.asarray(sp(x))
+            tables.append({"keyword": f"BOND_{i}", "x": x, "y": y, "type_idx": i})
+        return {
+            "interaction_type": "bond",
+            "lammps_style": "table",
+            "n_points": n_points,
+            "tables": tables,
+        }
 
     def get_energy_fn(self):
         # Create spline for each type
@@ -320,15 +329,13 @@ class TabulatedBondEnergy:
 
         def energy_fn(system, neighbors, **dynamic_kwargs):
             positions = system.R
-            # Use cached displacement function with pre-computed cell inverse
-            disp_fn = make_displacement_with_cached_inverse(system.cell)
-            Ra = positions[self.bonds[:, 0]]
+            disp_fn = get_displacement_fn(system.cell)
             Rb = positions[self.bonds[:, 1]]
-            edges = vmap(disp_fn)(Ra, Rb)
+            Ra = positions[self.bonds[:, 0]]
+            edges = vmap(disp_fn)(Rb, Ra)  # Rb - Ra (JAX-MD: first - second)
             dr = vmap(distance)(edges)
 
             if self.bond_types is not None:
-                # Use lax.switch to select spline per bond - more efficient for many types
                 def eval_spline(type_idx, d):
                     branches = [lambda d, s=s: s(d) for s in splines]
                     return jax.lax.switch(type_idx, branches, d)
@@ -340,29 +347,46 @@ class TabulatedBondEnergy:
         return energy_fn
 
 class HarmonicBondEnergy:
+    interaction_type = "bond"
+
     def __init__(self, bonds, length=0.45, epsilon=5000, bond_types=None):
         self.bonds = bonds
         self.length = jnp.atleast_1d(jnp.asarray(length))
         self.epsilon = jnp.atleast_1d(jnp.asarray(epsilon))
         self.bond_types = bond_types
 
+    def to_lammps(self):
+        # simple_spring: epsilon/alpha * |r - length|^alpha, alpha=2
+        # LAMMPS harmonic: K*(r - r0)^2, so K = epsilon/2
+        n = len(self.length)
+        coeffs = []
+        for i in range(n):
+            K_kjmol = float(self.epsilon[i]) / 2.0  # kJ/(mol*nm^2)
+            r0_nm = float(self.length[i])
+            # Convert: K in kcal/(mol*A^2), r0 in A
+            K_kcal = K_kjmol * KJMOL_TO_KCALMOL / (NM_TO_ANGSTROM ** 2)
+            r0_ang = r0_nm * NM_TO_ANGSTROM
+            coeffs.append({"type_idx": i, "params": [K_kcal, r0_ang]})
+        return {
+            "interaction_type": "bond",
+            "lammps_style": "harmonic",
+            "coeffs": coeffs,
+        }
+
     def get_energy_fn(self):
 
         def energy_fn(system, neighbors, **dynamic_kwargs):
             positions = system.R
-            # Use cached displacement function with pre-computed cell inverse
-            disp_fn = make_displacement_with_cached_inverse(system.cell)
-            Ra = positions[self.bonds[:, 0]]
+            disp_fn = get_displacement_fn(system.cell)
             Rb = positions[self.bonds[:, 1]]
-            edges = vmap(disp_fn)(Ra, Rb)
+            Ra = positions[self.bonds[:, 0]]
+            edges = vmap(disp_fn)(Rb, Ra)  # Rb - Ra (JAX-MD: first - second)
             dr = vmap(distance)(edges)
 
             if self.bond_types is not None:
-                # Per-type: index parameters by type
                 lengths = self.length[self.bond_types]
                 epsilons = self.epsilon[self.bond_types]
             else:
-                # Backward compatible: broadcast scalar
                 lengths = self.length[0]
                 epsilons = self.epsilon[0]
 
@@ -371,12 +395,28 @@ class HarmonicBondEnergy:
 
 
 class TabulatedAngleEnergy:
+    interaction_type = "angle"
+
     def __init__(self, x_vals, y_vals, angles, angle_types=None):
         self.x_vals = x_vals
         self.y_vals = jnp.atleast_2d(jnp.asarray(y_vals))  # (N_types, N_grid)
         self.angles = angles
         self.angle_types = angle_types
         self.n_types = self.y_vals.shape[0]
+
+    def to_lammps(self, n_points=500):
+        x = np.linspace(float(self.x_vals[0]), float(self.x_vals[-1]), n_points)
+        tables = []
+        for i in range(self.n_types):
+            sp = custom_interpolate.MonotonicInterpolate(self.x_vals, self.y_vals[i])
+            y = np.asarray(sp(x))
+            tables.append({"keyword": f"ANGLE_{i}", "x": x, "y": y, "type_idx": i})
+        return {
+            "interaction_type": "angle",
+            "lammps_style": "table",
+            "n_points": n_points,
+            "tables": tables,
+        }
 
     def get_energy_fn(self):
         # Create spline for each type
@@ -385,15 +425,14 @@ class TabulatedAngleEnergy:
 
         def energy_fn(system, neighbors, **dynamic_kwargs):
             positions = system.R
-            # Use cached displacement function with pre-computed cell inverse
-            disp_fn = make_displacement_with_cached_inverse(system.cell)
-            R_kj = vmap(disp_fn)(positions[self.angles[:,2]], positions[self.angles[:,1]])
-            R_ij = vmap(disp_fn)(positions[self.angles[:,0]], positions[self.angles[:,1]])
+            disp_fn = get_displacement_fn(system.cell)
+            # Swap args: JAX-MD disp(A,B) = A-B, so disp(j,k) = j-k = R_kj
+            R_kj = vmap(disp_fn)(positions[self.angles[:,1]], positions[self.angles[:,2]])
+            R_ij = vmap(disp_fn)(positions[self.angles[:,1]], positions[self.angles[:,0]])
 
             angles = vectorized_angle_fn(R_ij, R_kj)
 
             if self.angle_types is not None:
-                # Use lax.switch to select spline per angle - more efficient for many types
                 def eval_spline(type_idx, a):
                     branches = [lambda a, s=s: s(a) for s in splines]
                     return jax.lax.switch(type_idx, branches, a)
@@ -405,28 +444,47 @@ class TabulatedAngleEnergy:
         return energy_fn
 
 class HarmonicAngleEnergy:
+    interaction_type = "angle"
+
     def __init__(self, angles, angle_0=1.5, epsilon=50, angle_types=None):
         self.angles = angles
         self.angle_0 = jnp.atleast_1d(jnp.asarray(angle_0))
         self.epsilon = jnp.atleast_1d(jnp.asarray(epsilon))
         self.angle_types = angle_types
 
+    def to_lammps(self):
+        # harmonic_angle: epsilon/alpha * (angle - angle_0)^alpha, alpha=2
+        # LAMMPS harmonic: K*(theta - theta0)^2, so K = epsilon/2
+        n = len(self.angle_0)
+        coeffs = []
+        for i in range(n):
+            K_kjmol = float(self.epsilon[i]) / 2.0  # kJ/(mol*rad^2)
+            theta0_rad = float(self.angle_0[i])
+            # Convert: K in kcal/(mol*rad^2), theta0 in degrees
+            K_kcal = K_kjmol * KJMOL_TO_KCALMOL / (RAD_TO_DEG ** 2)
+            # Note: LAMMPS harmonic angle uses K*(theta-theta0)^2 with theta in degrees,
+            # so K must be in kcal/(mol*deg^2)
+            theta0_deg = theta0_rad * RAD_TO_DEG
+            coeffs.append({"type_idx": i, "params": [K_kcal, theta0_deg]})
+        return {
+            "interaction_type": "angle",
+            "lammps_style": "harmonic",
+            "coeffs": coeffs,
+        }
+
     def get_energy_fn(self):
         def energy_fn(system, neighbors, **dynamic_kwargs):
             positions = system.R
-            # Use cached displacement function with pre-computed cell inverse
-            disp_fn = make_displacement_with_cached_inverse(system.cell)
-            R_kj = vmap(disp_fn)(positions[self.angles[:,2]], positions[self.angles[:,1]])
-            R_ij = vmap(disp_fn)(positions[self.angles[:,0]], positions[self.angles[:,1]])
+            disp_fn = get_displacement_fn(system.cell)
+            R_kj = vmap(disp_fn)(positions[self.angles[:,1]], positions[self.angles[:,2]])
+            R_ij = vmap(disp_fn)(positions[self.angles[:,1]], positions[self.angles[:,0]])
 
             angles = vectorized_angle_fn(R_ij, R_kj)
 
             if self.angle_types is not None:
-                # Per-type: index parameters by type
                 angle_0s = self.angle_0[self.angle_types]
                 epsilons = self.epsilon[self.angle_types]
             else:
-                # Backward compatible: broadcast scalar
                 angle_0s = self.angle_0[0]
                 epsilons = self.epsilon[0]
 
@@ -434,12 +492,28 @@ class HarmonicAngleEnergy:
         return energy_fn
 
 class TabulatedDihedralEnergy:
+    interaction_type = "dihedral"
+
     def __init__(self, x_vals, y_vals, dihedrals, dihedral_types=None):
         self.x_vals = x_vals
         self.y_vals = jnp.atleast_2d(jnp.asarray(y_vals))  # (N_types, N_grid)
         self.dihedrals = dihedrals
         self.dihedral_types = dihedral_types
         self.n_types = self.y_vals.shape[0]
+
+    def to_lammps(self, n_points=500):
+        x = np.linspace(float(self.x_vals[0]), float(self.x_vals[-1]), n_points)
+        tables = []
+        for i in range(self.n_types):
+            sp = custom_interpolate.MonotonicInterpolate(self.x_vals, self.y_vals[i])
+            y = np.asarray(sp(x))
+            tables.append({"keyword": f"DIHEDRAL_{i}", "x": x, "y": y, "type_idx": i})
+        return {
+            "interaction_type": "dihedral",
+            "lammps_style": "table",
+            "n_points": n_points,
+            "tables": tables,
+        }
 
     def get_energy_fn(self):
         # Create spline for each type
@@ -448,16 +522,15 @@ class TabulatedDihedralEnergy:
 
         def energy_fn(system, neighbors, **dynamic_kwargs):
             positions = system.R
-            # Use cached displacement function with pre-computed cell inverse
-            disp_fn = make_displacement_with_cached_inverse(system.cell)
-            R_cd = vmap(disp_fn)(positions[self.dihedrals[:,3]], positions[self.dihedrals[:,2]])
-            R_bc = vmap(disp_fn)(positions[self.dihedrals[:,2]], positions[self.dihedrals[:,1]])
+            disp_fn = get_displacement_fn(system.cell)
+            # disp_fn(A,B) = A-B, so swap args to get forward vectors (a→b, b→c, c→d)
             R_ab = vmap(disp_fn)(positions[self.dihedrals[:,1]], positions[self.dihedrals[:,0]])
+            R_bc = vmap(disp_fn)(positions[self.dihedrals[:,2]], positions[self.dihedrals[:,1]])
+            R_cd = vmap(disp_fn)(positions[self.dihedrals[:,3]], positions[self.dihedrals[:,2]])
 
             dihedrals = vectorized_dihedral_fn(R_ab, R_bc, R_cd)
 
             if self.dihedral_types is not None:
-                # Use lax.switch to select spline per dihedral - more efficient for many types
                 def eval_spline(type_idx, d):
                     branches = [lambda d, s=s: s(d) for s in splines]
                     return jax.lax.switch(type_idx, branches, d)
@@ -469,28 +542,46 @@ class TabulatedDihedralEnergy:
         return energy_fn
 
 class HarmonicDihedralEnergy:
+    interaction_type = "dihedral"
+
     def __init__(self, dihedrals, angle_0=1.5, epsilon=50, dihedral_types=None):
         self.dihedrals = dihedrals
         self.angle_0 = jnp.atleast_1d(jnp.asarray(angle_0))
         self.epsilon = jnp.atleast_1d(jnp.asarray(epsilon))
         self.dihedral_types = dihedral_types
 
+    def to_lammps(self, n_points=500):
+        # LAMMPS "harmonic" dihedral is cosine-based, not quadratic.
+        # Always use table style for quadratic harmonic dihedrals.
+        x = np.linspace(-np.pi + 1e-4, np.pi - 1e-4, n_points)
+        tables = []
+        n = len(self.angle_0)
+        for i in range(n):
+            y = np.asarray(harmonic_dihedral(
+                x, angle_0=float(self.angle_0[i]), epsilon=float(self.epsilon[i])
+            ))
+            tables.append({"keyword": f"DIHEDRAL_{i}", "x": x, "y": y, "type_idx": i})
+        return {
+            "interaction_type": "dihedral",
+            "lammps_style": "table",
+            "n_points": n_points,
+            "tables": tables,
+        }
+
     def get_energy_fn(self):
         def energy_fn(system, neighbors, **dynamic_kwargs):
             positions = system.R
-            # Use cached displacement function with pre-computed cell inverse
-            disp_fn = make_displacement_with_cached_inverse(system.cell)
-            R_cd = vmap(disp_fn)(positions[self.dihedrals[:,3]], positions[self.dihedrals[:,2]])
-            R_bc = vmap(disp_fn)(positions[self.dihedrals[:,2]], positions[self.dihedrals[:,1]])
+            disp_fn = get_displacement_fn(system.cell)
+            # disp_fn(A,B) = A-B, so swap args to get forward vectors (a→b, b→c, c→d)
             R_ab = vmap(disp_fn)(positions[self.dihedrals[:,1]], positions[self.dihedrals[:,0]])
+            R_bc = vmap(disp_fn)(positions[self.dihedrals[:,2]], positions[self.dihedrals[:,1]])
+            R_cd = vmap(disp_fn)(positions[self.dihedrals[:,3]], positions[self.dihedrals[:,2]])
             dihedrals = vectorized_dihedral_fn(R_ab, R_bc, R_cd)
 
             if self.dihedral_types is not None:
-                # Per-type: index parameters by type
                 angle_0s = self.angle_0[self.dihedral_types]
                 epsilons = self.epsilon[self.dihedral_types]
             else:
-                # Backward compatible: broadcast scalar
                 angle_0s = self.angle_0[0]
                 epsilons = self.epsilon[0]
 
@@ -498,11 +589,10 @@ class HarmonicDihedralEnergy:
         return energy_fn
 
 class GenericRepulsionEnergy:
-    def __init__(self, sigma=0.6, epsilon=1., exp=8, mask_topology=None,
-                 max_num_atoms=None, r_onset=0.9, r_cutoff=1.0,
+    interaction_type = "pair"
+
+    def __init__(self, sigma=0.6, epsilon=1., exp=8, r_onset=0.9, r_cutoff=1.0,
                  atom_types=None, pair_type_map=None):
-        self.mask_topology = mask_topology
-        self.max_num_atoms = max_num_atoms
         self.r_onset = r_onset
         self.r_cutoff = r_cutoff
         self.atom_types = None if atom_types is None else jnp.asarray(atom_types, dtype=jnp.int32)
@@ -517,102 +607,397 @@ class GenericRepulsionEnergy:
             self.epsilon = epsilon
             self.exp = exp
 
-        # Pre-compute bonded pairs for O(n log m) lookup
-        self.bonded_pairs = None
-        if mask_topology is not None:
-            self.bonded_pairs = build_bonded_pair_set(mask_topology)
+    def to_lammps(self, n_points=500, r_min=0.05):
+        """No native LAMMPS style for generic repulsion — always tabulated."""
+        x = np.linspace(r_min, float(self.r_cutoff), n_points)
+        tables = []
+        if self.atom_types is not None:
+            ptm = np.asarray(self.pair_type_map)
+            n_at = ptm.shape[0]
+            seen = set()
+            for i in range(n_at):
+                for j in range(i, n_at):
+                    pt = int(ptm[i, j])
+                    if pt in seen:
+                        continue
+                    seen.add(pt)
+                    sig = float(self.sigma[pt])
+                    eps = float(self.epsilon[pt])
+                    exp_v = float(self.exp[pt])
+                    y = np.asarray(
+                        _smooth_cutoff_factor(x, self.r_onset, self.r_cutoff)
+                        * generic_repulsion(x, sigma=sig, epsilon=eps, exp=exp_v)
+                    )
+                    tables.append({"keyword": f"PAIR_{pt}", "x": x, "y": y, "types": (i, j)})
+        else:
+            y = np.asarray(
+                _smooth_cutoff_factor(x, self.r_onset, self.r_cutoff)
+                * generic_repulsion(x, sigma=self.sigma, epsilon=self.epsilon, exp=self.exp)
+            )
+            tables.append({"keyword": "PAIR_0", "x": x, "y": y, "types": None})
+        return {
+            "interaction_type": "pair",
+            "lammps_style": "table",
+            "n_points": n_points,
+            "cutoff": float(self.r_cutoff) * NM_TO_ANGSTROM,
+            "tables": tables,
+        }
 
     def get_energy_fn(self):
-        if self.mask_topology is None:
-            def energy_fn(system, neighbors, **dynamic_kwargs):
-                positions = system.R
+        def energy_fn(system, neighbors, **dynamic_kwargs):
+            positions = system.R
+            disp_fn = get_displacement_fn(system.cell)
+            dr, dR, mask, normalization, type_i_idx, type_j_idx = compute_pair_distances(
+                positions, neighbors, disp_fn)
 
-                # Convert JAX-MD neighbor list to edge list
-                centers, others, N = _get_edge_list_from_jaxmd_neighbors(neighbors)
+            if self.atom_types is not None:
+                type_i = self.atom_types[type_i_idx]
+                type_j = self.atom_types[type_j_idx]
+                pair_types = self.pair_type_map[type_i, type_j]
+                sigma_vals = self.sigma[pair_types]
+                epsilon_vals = self.epsilon[pair_types]
+                exp_vals = self.exp[pair_types]
+            else:
+                sigma_vals, epsilon_vals, exp_vals = self.sigma, self.epsilon, self.exp
 
-                # Clamp indices to valid range to prevent OOB access from padding entries
-                safe_others = jnp.minimum(others, N - 1)
+            _energy = _smooth_cutoff_factor(dr, self.r_onset, self.r_cutoff) * generic_repulsion(dr, sigma_vals, epsilon_vals, exp_vals)
+            out = _energy * mask
+            return high_precision_sum(out) / normalization
 
-                # Use cached displacement function with pre-computed cell inverse
-                disp_fn = make_displacement_with_cached_inverse(system.cell)
-                edges = vmap(disp_fn)(positions[centers], positions[safe_others])
-                dr = vmap(distance)(edges)
+        return energy_fn
 
-                if self.atom_types is not None:
-                    type_i = self.atom_types[centers]
-                    type_j = self.atom_types[safe_others]
-                    pair_types = self.pair_type_map[type_i, type_j]
-                    sigma_vals = self.sigma[pair_types]
-                    epsilon_vals = self.epsilon[pair_types]
-                    exp_vals = self.exp[pair_types]
-                else:
-                    sigma_vals, epsilon_vals, exp_vals = self.sigma, self.epsilon, self.exp
 
-                _energy = _smooth_cutoff_factor(dr, self.r_onset, self.r_cutoff) * generic_repulsion(dr, sigma_vals, epsilon_vals, exp_vals)
-                mask = others < N  # Filter padding (JAX-MD uses N as padding value for unused neighbor slots)
+class LJEnergy:
+    """Lennard-Jones 12-6 pair energy with smooth cutoff and per-type support."""
+    interaction_type = "pair"
 
-                out = _energy * mask
-                return high_precision_sum(out) * 0.5
+    def __init__(self, sigma=1.0, epsilon=1.0, r_onset=2.0, r_cutoff=2.5,
+                 atom_types=None, pair_type_map=None):
+        self.r_onset = r_onset
+        self.r_cutoff = r_cutoff
+        self.atom_types = None if atom_types is None else jnp.asarray(atom_types, dtype=jnp.int32)
+        self.pair_type_map = None if pair_type_map is None else jnp.asarray(pair_type_map, dtype=jnp.int32)
 
-            return energy_fn
+        if self.atom_types is not None:
+            self.sigma = jnp.atleast_1d(jnp.asarray(sigma))
+            self.epsilon = jnp.atleast_1d(jnp.asarray(epsilon))
         else:
-            # Capture pre-computed bonded pairs in closure
-            bonded_pairs = self.bonded_pairs
+            self.sigma = sigma
+            self.epsilon = epsilon
 
-            def energy_fn(system, neighbors, **dynamic_kwargs):
-                positions = system.R
+    def to_lammps(self):
+        cutoff_ang = float(self.r_cutoff) * NM_TO_ANGSTROM
+        coeffs = []
+        if self.atom_types is not None:
+            ptm = np.asarray(self.pair_type_map)
+            n_at = ptm.shape[0]
+            seen = set()
+            for i in range(n_at):
+                for j in range(i, n_at):
+                    pt = int(ptm[i, j])
+                    if pt in seen:
+                        continue
+                    seen.add(pt)
+                    eps_kcal = float(self.epsilon[pt]) * KJMOL_TO_KCALMOL
+                    sig_ang = float(self.sigma[pt]) * NM_TO_ANGSTROM
+                    coeffs.append({"types": (i, j), "params": [eps_kcal, sig_ang]})
+        else:
+            eps_kcal = float(self.epsilon) * KJMOL_TO_KCALMOL
+            sig_ang = float(self.sigma) * NM_TO_ANGSTROM
+            coeffs.append({"types": None, "params": [eps_kcal, sig_ang]})
+        return {
+            "interaction_type": "pair",
+            "lammps_style": "lj/cut",
+            "cutoff": cutoff_ang,
+            "coeffs": coeffs,
+        }
 
-                # Convert JAX-MD neighbor list to edge list
-                centers, others, N = _get_edge_list_from_jaxmd_neighbors(neighbors)
+    def get_energy_fn(self):
+        def energy_fn(system, neighbors, **dynamic_kwargs):
+            positions = system.R
+            disp_fn = get_displacement_fn(system.cell)
+            dr, dR, mask, normalization, type_i_idx, type_j_idx = compute_pair_distances(
+                positions, neighbors, disp_fn)
 
-                mask_centers, mask_others = mask_bonded_neighbors(
-                    (centers, others), self.mask_topology, self.max_num_atoms,
-                    bonded_pairs=bonded_pairs
-                )
-                mask = mask_centers < N
+            if self.atom_types is not None:
+                type_i = self.atom_types[type_i_idx]
+                type_j = self.atom_types[type_j_idx]
+                pair_types = self.pair_type_map[type_i, type_j]
+                sigma_vals = self.sigma[pair_types]
+                epsilon_vals = self.epsilon[pair_types]
+            else:
+                sigma_vals, epsilon_vals = self.sigma, self.epsilon
 
-                # Clamp indices to valid range to prevent OOB access from padding entries
-                safe_others = jnp.minimum(others, N - 1)
+            _energy = _smooth_cutoff_factor(dr, self.r_onset, self.r_cutoff) * lj(dr, sigma_vals, epsilon_vals)
+            out = _energy * mask
+            return high_precision_sum(out) / normalization
 
-                # Use cached displacement function with pre-computed cell inverse
-                disp_fn = make_displacement_with_cached_inverse(system.cell)
-                edges = vmap(disp_fn)(positions[centers], positions[safe_others])
-                dr = vmap(distance)(edges)
+        return energy_fn
 
-                if self.atom_types is not None:
-                    type_i = self.atom_types[centers]
-                    type_j = self.atom_types[safe_others]
-                    pair_types = self.pair_type_map[type_i, type_j]
-                    sigma_vals = self.sigma[pair_types]
-                    epsilon_vals = self.epsilon[pair_types]
-                    exp_vals = self.exp[pair_types]
-                else:
-                    sigma_vals, epsilon_vals, exp_vals = self.sigma, self.epsilon, self.exp
 
-                _energy = _smooth_cutoff_factor(dr, self.r_onset, self.r_cutoff) * generic_repulsion(dr, sigma_vals, epsilon_vals, exp_vals)
-                out = _energy * mask
-                return high_precision_sum(out) * 0.5
+class SoftEnergy:
+    """Soft cosine pair energy with per-type support.
 
-            return energy_fn
+    No r_onset needed — potential is naturally zero at r_cutoff.
+    """
+    interaction_type = "pair"
+
+    def __init__(self, A=1.0, r_cutoff=1.0,
+                 atom_types=None, pair_type_map=None):
+        self.r_cutoff = r_cutoff
+        self.atom_types = None if atom_types is None else jnp.asarray(atom_types, dtype=jnp.int32)
+        self.pair_type_map = None if pair_type_map is None else jnp.asarray(pair_type_map, dtype=jnp.int32)
+
+        if self.atom_types is not None:
+            self.A = jnp.atleast_1d(jnp.asarray(A))
+        else:
+            self.A = A
+
+    def to_lammps(self):
+        cutoff_ang = float(self.r_cutoff) * NM_TO_ANGSTROM
+        coeffs = []
+        if self.atom_types is not None:
+            ptm = np.asarray(self.pair_type_map)
+            n_at = ptm.shape[0]
+            seen = set()
+            for i in range(n_at):
+                for j in range(i, n_at):
+                    pt = int(ptm[i, j])
+                    if pt in seen:
+                        continue
+                    seen.add(pt)
+                    A_kcal = float(self.A[pt]) * KJMOL_TO_KCALMOL
+                    coeffs.append({"types": (i, j), "params": [A_kcal]})
+        else:
+            A_kcal = float(self.A) * KJMOL_TO_KCALMOL
+            coeffs.append({"types": None, "params": [A_kcal]})
+        return {
+            "interaction_type": "pair",
+            "lammps_style": "soft",
+            "cutoff": cutoff_ang,
+            "coeffs": coeffs,
+        }
+
+    def get_energy_fn(self):
+        def energy_fn(system, neighbors, **dynamic_kwargs):
+            positions = system.R
+            disp_fn = get_displacement_fn(system.cell)
+            dr, dR, mask, normalization, type_i_idx, type_j_idx = compute_pair_distances(
+                positions, neighbors, disp_fn)
+
+            if self.atom_types is not None:
+                type_i = self.atom_types[type_i_idx]
+                type_j = self.atom_types[type_j_idx]
+                pair_types = self.pair_type_map[type_i, type_j]
+                A_vals = self.A[pair_types]
+            else:
+                A_vals = self.A
+
+            _energy = jnp.where(dr < self.r_cutoff, soft(dr, A_vals, self.r_cutoff), 0.0)
+            out = _energy * mask
+            return high_precision_sum(out) / normalization
+
+        return energy_fn
+
+
+class MorseEnergy:
+    """Morse pair energy with smooth cutoff and per-type support."""
+    interaction_type = "pair"
+
+    def __init__(self, D=1.0, alpha=1.0, r0=1.0, r_onset=2.0, r_cutoff=2.5,
+                 atom_types=None, pair_type_map=None):
+        self.r_onset = r_onset
+        self.r_cutoff = r_cutoff
+        self.atom_types = None if atom_types is None else jnp.asarray(atom_types, dtype=jnp.int32)
+        self.pair_type_map = None if pair_type_map is None else jnp.asarray(pair_type_map, dtype=jnp.int32)
+
+        if self.atom_types is not None:
+            self.D = jnp.atleast_1d(jnp.asarray(D))
+            self.alpha = jnp.atleast_1d(jnp.asarray(alpha))
+            self.r0 = jnp.atleast_1d(jnp.asarray(r0))
+        else:
+            self.D = D
+            self.alpha = alpha
+            self.r0 = r0
+
+    def to_lammps(self):
+        cutoff_ang = float(self.r_cutoff) * NM_TO_ANGSTROM
+        coeffs = []
+        if self.atom_types is not None:
+            ptm = np.asarray(self.pair_type_map)
+            n_at = ptm.shape[0]
+            seen = set()
+            for i in range(n_at):
+                for j in range(i, n_at):
+                    pt = int(ptm[i, j])
+                    if pt in seen:
+                        continue
+                    seen.add(pt)
+                    D_kcal = float(self.D[pt]) * KJMOL_TO_KCALMOL
+                    alpha_inv_ang = float(self.alpha[pt]) / NM_TO_ANGSTROM  # 1/nm -> 1/A
+                    r0_ang = float(self.r0[pt]) * NM_TO_ANGSTROM
+                    coeffs.append({"types": (i, j), "params": [D_kcal, alpha_inv_ang, r0_ang]})
+        else:
+            D_kcal = float(self.D) * KJMOL_TO_KCALMOL
+            alpha_inv_ang = float(self.alpha) / NM_TO_ANGSTROM
+            r0_ang = float(self.r0) * NM_TO_ANGSTROM
+            coeffs.append({"types": None, "params": [D_kcal, alpha_inv_ang, r0_ang]})
+        return {
+            "interaction_type": "pair",
+            "lammps_style": "morse",
+            "cutoff": cutoff_ang,
+            "coeffs": coeffs,
+        }
+
+    def get_energy_fn(self):
+        def energy_fn(system, neighbors, **dynamic_kwargs):
+            positions = system.R
+            disp_fn = get_displacement_fn(system.cell)
+            dr, dR, mask, normalization, type_i_idx, type_j_idx = compute_pair_distances(
+                positions, neighbors, disp_fn)
+
+            if self.atom_types is not None:
+                type_i = self.atom_types[type_i_idx]
+                type_j = self.atom_types[type_j_idx]
+                pair_types = self.pair_type_map[type_i, type_j]
+                D_vals = self.D[pair_types]
+                alpha_vals = self.alpha[pair_types]
+                r0_vals = self.r0[pair_types]
+            else:
+                D_vals, alpha_vals, r0_vals = self.D, self.alpha, self.r0
+
+            _energy = _smooth_cutoff_factor(dr, self.r_onset, self.r_cutoff) * morse(dr, D_vals, alpha_vals, r0_vals)
+            out = _energy * mask
+            return high_precision_sum(out) / normalization
+
+        return energy_fn
+
+
+class MieEnergy:
+    """Mie (generalized LJ) pair energy with smooth cutoff and per-type support."""
+    interaction_type = "pair"
+
+    def __init__(self, sigma=1.0, epsilon=1.0, gamma_r=12.0, gamma_a=6.0,
+                 r_onset=2.0, r_cutoff=2.5,
+                 atom_types=None, pair_type_map=None):
+        self.r_onset = r_onset
+        self.r_cutoff = r_cutoff
+        self.atom_types = None if atom_types is None else jnp.asarray(atom_types, dtype=jnp.int32)
+        self.pair_type_map = None if pair_type_map is None else jnp.asarray(pair_type_map, dtype=jnp.int32)
+
+        if self.atom_types is not None:
+            self.sigma = jnp.atleast_1d(jnp.asarray(sigma))
+            self.epsilon = jnp.atleast_1d(jnp.asarray(epsilon))
+            self.gamma_r = jnp.atleast_1d(jnp.asarray(gamma_r))
+            self.gamma_a = jnp.atleast_1d(jnp.asarray(gamma_a))
+        else:
+            self.sigma = sigma
+            self.epsilon = epsilon
+            self.gamma_r = gamma_r
+            self.gamma_a = gamma_a
+
+    def to_lammps(self):
+        cutoff_ang = float(self.r_cutoff) * NM_TO_ANGSTROM
+        coeffs = []
+        if self.atom_types is not None:
+            ptm = np.asarray(self.pair_type_map)
+            n_at = ptm.shape[0]
+            seen = set()
+            for i in range(n_at):
+                for j in range(i, n_at):
+                    pt = int(ptm[i, j])
+                    if pt in seen:
+                        continue
+                    seen.add(pt)
+                    eps_kcal = float(self.epsilon[pt]) * KJMOL_TO_KCALMOL
+                    sig_ang = float(self.sigma[pt]) * NM_TO_ANGSTROM
+                    gr = float(self.gamma_r[pt])
+                    ga = float(self.gamma_a[pt])
+                    coeffs.append({"types": (i, j), "params": [eps_kcal, sig_ang, gr, ga]})
+        else:
+            eps_kcal = float(self.epsilon) * KJMOL_TO_KCALMOL
+            sig_ang = float(self.sigma) * NM_TO_ANGSTROM
+            gr = float(self.gamma_r)
+            ga = float(self.gamma_a)
+            coeffs.append({"types": None, "params": [eps_kcal, sig_ang, gr, ga]})
+        return {
+            "interaction_type": "pair",
+            "lammps_style": "mie/cut",
+            "cutoff": cutoff_ang,
+            "coeffs": coeffs,
+        }
+
+    def get_energy_fn(self):
+        def energy_fn(system, neighbors, **dynamic_kwargs):
+            positions = system.R
+            disp_fn = get_displacement_fn(system.cell)
+            dr, dR, mask, normalization, type_i_idx, type_j_idx = compute_pair_distances(
+                positions, neighbors, disp_fn)
+
+            if self.atom_types is not None:
+                type_i = self.atom_types[type_i_idx]
+                type_j = self.atom_types[type_j_idx]
+                pair_types = self.pair_type_map[type_i, type_j]
+                sigma_vals = self.sigma[pair_types]
+                epsilon_vals = self.epsilon[pair_types]
+                gamma_r_vals = self.gamma_r[pair_types]
+                gamma_a_vals = self.gamma_a[pair_types]
+            else:
+                sigma_vals, epsilon_vals = self.sigma, self.epsilon
+                gamma_r_vals, gamma_a_vals = self.gamma_r, self.gamma_a
+
+            _energy = _smooth_cutoff_factor(dr, self.r_onset, self.r_cutoff) * mie(dr, sigma_vals, epsilon_vals, gamma_r_vals, gamma_a_vals)
+            out = _energy * mask
+            return high_precision_sum(out) / normalization
+
+        return energy_fn
 
 
 class TabulatedPairEnergy:
+    interaction_type = "pair"
+
     def __init__(self, x_vals, y_vals, r_onset, r_cutoff,
-                 mask_topology=None, max_num_atoms=None,
                  atom_types=None, pair_type_map=None):
         self.x_vals = x_vals
         self.y_vals = jnp.atleast_2d(jnp.asarray(y_vals))  # (n_pair_types, N_grid) or (1, N_grid)
         self.r_onset = r_onset
         self.r_cutoff = r_cutoff
-        self.mask_topology = mask_topology
-        self.max_num_atoms = max_num_atoms
         self.atom_types = None if atom_types is None else jnp.asarray(atom_types, dtype=jnp.int32)
         self.pair_type_map = None if pair_type_map is None else jnp.asarray(pair_type_map, dtype=jnp.int32)
         self.n_pair_types = self.y_vals.shape[0]
-        # Pre-compute bonded pairs for O(n log m) lookup
-        self.bonded_pairs = None
-        if mask_topology is not None:
-            self.bonded_pairs = build_bonded_pair_set(mask_topology)
+
+    def to_lammps(self, n_points=500, r_min=0.05):
+        x = np.linspace(r_min, float(self.r_cutoff), n_points)
+        cutoff_ang = float(self.r_cutoff) * NM_TO_ANGSTROM
+        tables = []
+        if self.atom_types is not None:
+            ptm = np.asarray(self.pair_type_map)
+            n_at = ptm.shape[0]
+            seen = set()
+            for i in range(n_at):
+                for j in range(i, n_at):
+                    pt = int(ptm[i, j])
+                    if pt in seen:
+                        continue
+                    seen.add(pt)
+                    sp = custom_interpolate.MonotonicInterpolate(self.x_vals, self.y_vals[pt])
+                    y = np.asarray(
+                        _smooth_cutoff_factor(x, self.r_onset, self.r_cutoff) * sp(x)
+                    )
+                    tables.append({"keyword": f"PAIR_{pt}", "x": x, "y": y, "types": (i, j)})
+        else:
+            sp = custom_interpolate.MonotonicInterpolate(self.x_vals, self.y_vals[0])
+            y = np.asarray(
+                _smooth_cutoff_factor(x, self.r_onset, self.r_cutoff) * sp(x)
+            )
+            tables.append({"keyword": "PAIR_0", "x": x, "y": y, "types": None})
+        return {
+            "interaction_type": "pair",
+            "lammps_style": "table",
+            "n_points": n_points,
+            "cutoff": cutoff_ang,
+            "tables": tables,
+        }
 
     def get_energy_fn(self):
         # Create one spline per pair type
@@ -626,74 +1011,194 @@ class TabulatedPairEnergy:
         else:
             truncated_fn = None  # not used in per-type path
 
-        if self.mask_topology is None:
-            def energy_fn(system, neighbors, **dynamic_kwargs):
-                positions = system.R
+        def energy_fn(system, neighbors, **dynamic_kwargs):
+            positions = system.R
+            disp_fn = get_displacement_fn(system.cell)
+            dr, dR, mask, normalization, type_i_idx, type_j_idx = compute_pair_distances(
+                positions, neighbors, disp_fn)
 
-                # Convert JAX-MD neighbor list to edge list
-                centers, others, N = _get_edge_list_from_jaxmd_neighbors(neighbors)
+            if self.atom_types is not None:
+                type_i = self.atom_types[type_i_idx]
+                type_j = self.atom_types[type_j_idx]
+                pair_types = self.pair_type_map[type_i, type_j]
+                # Flatten for spline evaluation, then reshape
+                flat_pair_types = pair_types.ravel()
+                flat_dr = dr.ravel()
+                def eval_spline(type_idx, d):
+                    return jax.lax.switch(type_idx, [lambda d, s=s: s(d) for s in splines], d)
+                raw_energies = vmap(eval_spline)(flat_pair_types, flat_dr)
+                raw_energies = raw_energies.reshape(dr.shape)
+                _energy = _smooth_cutoff_factor(dr, self.r_onset, self.r_cutoff) * raw_energies
+            else:
+                _energy = truncated_fn(dr)
 
-                # Clamp indices to valid range to prevent OOB access from padding entries
-                safe_others = jnp.minimum(others, N - 1)
+            out = _energy * mask
+            return high_precision_sum(out) / normalization
 
-                # Use cached displacement function with pre-computed cell inverse
-                disp_fn = make_displacement_with_cached_inverse(system.cell)
-                edges = vmap(disp_fn)(positions[centers], positions[safe_others])
-                dr = vmap(distance)(edges)
+        return energy_fn
 
-                mask = others < N  # Filter padding
 
-                if self.atom_types is not None:
-                    type_i = self.atom_types[centers]
-                    type_j = self.atom_types[safe_others]
-                    pair_types = self.pair_type_map[type_i, type_j]
-                    def eval_spline(type_idx, d):
-                        return jax.lax.switch(type_idx, [lambda d, s=s: s(d) for s in splines], d)
-                    raw_energies = vmap(eval_spline)(pair_types, dr)
-                    _energy = _smooth_cutoff_factor(dr, self.r_onset, self.r_cutoff) * raw_energies
-                else:
-                    _energy = truncated_fn(dr)
+# ---------------------------------------------------------------------------
+# LAMMPS spec combiner
+# ---------------------------------------------------------------------------
 
-                out = _energy * mask
-                return high_precision_sum(out) * 0.5
+def build_lammps_specs(*energy_objects):
+    """Combine energy objects into LAMMPS style/coeff specifications.
 
-            return energy_fn
+    Returns dict with keys 'pair', 'bond', 'angle', 'dihedral'.
+    Each value describes the style(s) and coefficients needed.
+    Handles hybrid/overlay when multiple pair styles are needed.
+
+    Args:
+        *energy_objects: Energy class instances that have ``to_lammps()`` methods.
+
+    Returns:
+        Dict mapping interaction type to LAMMPS specification dict.
+    """
+    groups: Dict[str, list] = {"pair": [], "bond": [], "angle": [], "dihedral": []}
+    for obj in energy_objects:
+        itype = obj.interaction_type
+        spec = obj.to_lammps()
+        groups[itype].append(spec)
+
+    result = {}
+
+    for itype in ("pair", "bond", "angle", "dihedral"):
+        specs = groups[itype]
+        if not specs:
+            continue
+
+        styles = set(s["lammps_style"] for s in specs)
+
+        if len(styles) == 1:
+            style = styles.pop()
+            if style == "table":
+                result[itype] = _merge_table_specs(specs, itype)
+            else:
+                all_coeffs = []
+                cutoff = max(s.get("cutoff", 0) for s in specs)
+                for s in specs:
+                    all_coeffs.extend(s.get("coeffs", []))
+                result[itype] = {
+                    "lammps_style": style,
+                    "cutoff": cutoff,
+                    "coeffs": all_coeffs,
+                }
         else:
-            # Capture pre-computed bonded pairs in closure
-            bonded_pairs = self.bonded_pairs
+            if itype == "pair":
+                result[itype] = _build_hybrid_pair_spec(specs)
+            else:
+                result[itype] = _build_hybrid_bonded_spec(specs, itype)
 
-            def energy_fn(system, neighbors, **dynamic_kwargs):
-                positions = system.R
+    return result
 
-                # Convert JAX-MD neighbor list to edge list
-                centers, others, N = _get_edge_list_from_jaxmd_neighbors(neighbors)
 
-                mask_centers, mask_others = mask_bonded_neighbors(
-                    (centers, others), self.mask_topology, self.max_num_atoms,
-                    bonded_pairs=bonded_pairs
-                )
-                mask = mask_centers < N
+def _merge_table_specs(specs, itype):
+    """Merge multiple table-style specs, summing y-values for same type indices."""
+    merged_tables = {}
 
-                # Clamp indices to valid range to prevent OOB access from padding entries
-                safe_others = jnp.minimum(others, N - 1)
+    for spec in specs:
+        for table in spec["tables"]:
+            if "type_idx" in table:
+                key = table["type_idx"]
+            elif "types" in table:
+                key = table["types"]
+            else:
+                key = 0
 
-                # Use cached displacement function with pre-computed cell inverse
-                disp_fn = make_displacement_with_cached_inverse(system.cell)
-                edges = vmap(disp_fn)(positions[centers], positions[safe_others])
-                dr = vmap(distance)(edges)
-
-                if self.atom_types is not None:
-                    type_i = self.atom_types[centers]
-                    type_j = self.atom_types[safe_others]
-                    pair_types = self.pair_type_map[type_i, type_j]
-                    def eval_spline(type_idx, d):
-                        return jax.lax.switch(type_idx, [lambda d, s=s: s(d) for s in splines], d)
-                    raw_energies = vmap(eval_spline)(pair_types, dr)
-                    _energy = _smooth_cutoff_factor(dr, self.r_onset, self.r_cutoff) * raw_energies
+            if key in merged_tables:
+                existing = merged_tables[key]
+                if len(existing["x"]) == len(table["x"]) and np.allclose(existing["x"], table["x"]):
+                    existing["y"] = existing["y"] + table["y"]
                 else:
-                    _energy = truncated_fn(dr)
+                    x_min = max(existing["x"][0], table["x"][0])
+                    x_max = min(existing["x"][-1], table["x"][-1])
+                    n = max(len(existing["x"]), len(table["x"]))
+                    x_new = np.linspace(x_min, x_max, n)
+                    y1 = np.interp(x_new, existing["x"], existing["y"])
+                    y2 = np.interp(x_new, table["x"], table["y"])
+                    existing["x"] = x_new
+                    existing["y"] = y1 + y2
+            else:
+                merged_tables[key] = {
+                    "keyword": table["keyword"],
+                    "x": np.asarray(table["x"]),
+                    "y": np.asarray(table["y"]),
+                }
+                if "types" in table:
+                    merged_tables[key]["types"] = table["types"]
+                if "type_idx" in table:
+                    merged_tables[key]["type_idx"] = table["type_idx"]
 
-                out = _energy * mask
-                return high_precision_sum(out) * 0.5
+    n_points = max(len(t["x"]) for t in merged_tables.values())
+    cutoff = max((s.get("cutoff", 0) for s in specs), default=0)
 
-            return energy_fn
+    return {
+        "lammps_style": "table",
+        "n_points": n_points,
+        "cutoff": cutoff,
+        "tables": list(merged_tables.values()),
+    }
+
+
+def _build_hybrid_pair_spec(specs):
+    """Build a hybrid/overlay pair style spec from mixed native + table specs."""
+    style_parts = []
+    seen_styles = {}
+    all_items = []
+
+    for spec in specs:
+        style = spec["lammps_style"]
+        cutoff = spec.get("cutoff", 0)
+
+        if style not in seen_styles:
+            if style == "table":
+                n_points = spec.get("n_points", 500)
+                # Table style: no cutoff in pair_style declaration
+                style_parts.append((f"table linear {n_points}", None))
+            else:
+                style_parts.append((style, cutoff))
+            seen_styles[style] = True
+
+        if style == "table":
+            for table in spec["tables"]:
+                all_items.append(("table", table))
+        else:
+            for coeff in spec.get("coeffs", []):
+                all_items.append((style, coeff))
+
+    return {
+        "lammps_style": "hybrid/overlay",
+        "style_parts": style_parts,
+        "items": all_items,
+    }
+
+
+def _build_hybrid_bonded_spec(specs, itype):
+    """Build a hybrid bonded style spec from mixed native + table specs."""
+    style_parts = []
+    seen_styles = {}
+    all_items = []
+
+    for spec in specs:
+        style = spec["lammps_style"]
+        if style not in seen_styles:
+            if style == "table":
+                n_points = spec.get("n_points", 500)
+                style_parts.append(f"table linear {n_points}")
+            else:
+                style_parts.append(style)
+            seen_styles[style] = True
+
+        if style == "table":
+            for table in spec["tables"]:
+                all_items.append(("table", table))
+        else:
+            for coeff in spec.get("coeffs", []):
+                all_items.append((style, coeff))
+
+    return {
+        "lammps_style": "hybrid",
+        "style_parts": style_parts,
+        "items": all_items,
+    }

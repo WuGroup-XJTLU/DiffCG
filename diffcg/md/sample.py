@@ -78,7 +78,7 @@ class MolecularDynamics:
         starting_temperature: Optional[float] = None,
         timestep: float = 2.0,
         cutoff: float = 1.0,
-        pressure: float = 1.01325e-4,
+        pressure: float = 1.01325,
         taut: Optional[float] = None,
         taup: Optional[float] = None,
         trajectory: Optional[str] = None,
@@ -87,6 +87,7 @@ class MolecularDynamics:
         capacity_multiplier: float = 1.25,
         random_seed: int = 0,
         friction: float = 1.0,
+        custom_mask_function: Optional[Callable] = None,
         **kwargs,
     ) -> None:
         # Validate thermostat
@@ -135,14 +136,18 @@ class MolecularDynamics:
             friction=friction,
             capacity_multiplier=capacity_multiplier,
             mass=masses,
+            custom_mask_function=custom_mask_function,
             **kwargs,
         )
 
         self._trajectory_positions: Optional[jnp.ndarray] = None
+        self._thermo: Optional[dict] = None
         self._md_result: Optional[MDResult] = None
         self._key = random.PRNGKey(random_seed)
         self._neighbor = None
         self._state = None
+        self._initial_state = None
+        self._initial_neighbor = None
 
         logger.debug(
             "Created MolecularDynamics: ensemble=%s, thermostat=%s, T=%s K, dt=%s fs",
@@ -156,12 +161,21 @@ class MolecularDynamics:
         logger.debug("Running MD for %s steps", steps)
 
         self._key, subkey = random.split(self._key)
+
+        # On first call, use stored initial state if available (restart support)
+        init_state = self._initial_state
+        init_neighbor = self._initial_neighbor
+        if init_state is not None:
+            self._initial_state = None
+            self._initial_neighbor = None
+
         result = self.sampler.run(
             R=self.positions,
             steps=steps,
             key=subkey,
-            neighbor=self._neighbor,
+            neighbor=init_neighbor if init_neighbor is not None else self._neighbor,
             save_frequency=self.loginterval,
+            initial_state=init_state,
         )
 
         self._md_result = result
@@ -169,6 +183,7 @@ class MolecularDynamics:
         self._state = result.final_state
         self.positions = result.final_state.position
         self._trajectory_positions = result.trajectory
+        self._thermo = result.thermo
 
         traj = Trajectory.from_positions(result.trajectory, self._system)
 
@@ -196,14 +211,27 @@ class MolecularDynamics:
         logger.debug("Saved trajectory to %s", self.trajectory_path)
 
     def _write_log(self, steps: int) -> None:
-        with open(self.logfile, 'a') as f:
+        thermo = getattr(self, '_thermo', None)
+        n_frames = len(self._trajectory_positions) if self._trajectory_positions is not None else 0
+        with open(self.logfile, 'w') as f:
             f.write(f"# JAX-MD Simulation Log\n")
-            f.write(f"# Ensemble: {self.ensemble}\n")
-            f.write(f"# Thermostat: {self.thermostat}\n")
-            f.write(f"# Temperature: {self.temperature} K\n")
-            f.write(f"# Timestep: {self.timestep} fs\n")
-            f.write(f"# Steps: {steps}\n")
-            f.write(f"# Frames saved: {len(self._trajectory_positions) if self._trajectory_positions is not None else 0}\n")
+            f.write(f"# Ensemble: {self.ensemble} | Thermostat: {self.thermostat} | Temperature: {self.temperature} K\n")
+            f.write(f"# Timestep: {self.timestep} fs | Steps: {steps} | Frames: {n_frames}\n")
+            if thermo is not None:
+                ke = np.asarray(thermo['kinetic_energy'])
+                pe = np.asarray(thermo['potential_energy'])
+                temp = np.asarray(thermo['temperature'])
+                etotal = np.asarray(thermo['total_energy'])
+                press = np.asarray(thermo.get('pressure', np.zeros_like(ke)))
+                has_pressure = np.any(press != 0.0)
+                if has_pressure:
+                    f.write("frame,KE(kJ/mol),PE(kJ/mol),E_total(kJ/mol),T(K),P(kJ/mol*nm^3)\n")
+                    for i in range(len(ke)):
+                        f.write(f"{i},{ke[i]:.6f},{pe[i]:.6f},{etotal[i]:.6f},{temp[i]:.2f},{press[i]:.6f}\n")
+                else:
+                    f.write("frame,KE(kJ/mol),PE(kJ/mol),E_total(kJ/mol),T(K)\n")
+                    for i in range(len(ke)):
+                        f.write(f"{i},{ke[i]:.6f},{pe[i]:.6f},{etotal[i]:.6f},{temp[i]:.2f}\n")
 
     def set_system(self, system: AtomicSystem) -> None:
         self._system = system
@@ -246,13 +274,25 @@ class MolecularDynamics:
         return trajectory_to_ase(self.get_trajectory())
 
     def get_final_system(self) -> AtomicSystem:
+        velocities = None
+        if self._state is not None and hasattr(self._state, 'momentum'):
+            velocities = self._state.momentum / self._state.mass
         return AtomicSystem(
             R=self.positions,
             Z=self.atomic_numbers,
             cell=self.cell,
             masses=self._masses_jax,
             pbc=self._system.pbc,
+            velocities=velocities,
         )
+
+    def get_final_state(self):
+        """Return the final JAX-MD integrator state (for restart)."""
+        return self._state
+
+    def get_final_neighbors(self):
+        """Return the final neighbor list (for restart)."""
+        return self._neighbor
 
 
 def create_molecular_dynamics(
@@ -282,16 +322,51 @@ def create_equilibration_run(
     energy_fn: Callable,
     sampler_params: dict,
     cutoff: float,
-) -> MolecularDynamics:
+    custom_mask_function: Optional[Callable] = None,
+    sampler_backend: str = "jaxmd",
+    lammps_config: Optional[dict] = None,
+):
     """Create an MD run configured for equilibration (no trajectory output).
 
     Args:
         system: Starting atomic system
-        energy_fn: Energy function
+        energy_fn: Energy function (ignored when sampler_backend="lammps")
         sampler_params: Dict with keys: ensemble, thermostat, temperature,
             starting_temperature (optional), timestep, friction (optional)
         cutoff: Neighbor list cutoff
+        sampler_backend: "jaxmd" (default) or "lammps"
+        lammps_config: Dict with LAMMPS-specific config (required when backend="lammps").
+            Keys: energy_params, topology, r_onset, mol_ids, lammps_exe, work_dir,
+            extra_lammps_commands, input_template
     """
+    _loginterval = sampler_params.get("loginterval", 100)
+
+    if sampler_backend == "lammps":
+        from diffcg.md.lammps_sampler import LAMMPSSampler
+        lc = lammps_config or {}
+        return LAMMPSSampler(
+            system,
+            energy_params=lc.get("energy_params"),
+            energy_objects=lc.get("energy_objects"),
+            topology=lc["topology"],
+            ensemble=sampler_params["ensemble"],
+            thermostat=sampler_params["thermostat"],
+            temperature=sampler_params["temperature"],
+            timestep=sampler_params["timestep"],
+            friction=sampler_params.get("friction", 1.0),
+            cutoff=cutoff,
+            r_onset=lc.get("r_onset", cutoff * 0.8),
+            mol_ids=lc.get("mol_ids"),
+            trajectory=None,
+            logfile=None,
+            loginterval=_loginterval,
+            lammps_exe=lc.get("lammps_exe", "lmp"),
+            work_dir=lc.get("work_dir"),
+            extra_lammps_commands=lc.get("extra_lammps_commands"),
+            input_template=lc.get("input_template"),
+            special_bonds=lc.get("special_bonds", "lj 0.0 0.0 0.0"),
+        )
+
     return MolecularDynamics(
         system,
         energy_fn=energy_fn,
@@ -306,7 +381,8 @@ def create_equilibration_run(
         friction=sampler_params.get("friction", 1.0),
         trajectory=None,
         logfile=None,
-        loginterval=1,
+        loginterval=_loginterval,
+        custom_mask_function=custom_mask_function,
     )
 
 
@@ -318,12 +394,16 @@ def create_production_run(
     trajectory: Optional[str] = None,
     logfile: Optional[str] = None,
     loginterval: Optional[int] = None,
-) -> MolecularDynamics:
+    custom_mask_function: Optional[Callable] = None,
+    sampler_backend: str = "jaxmd",
+    lammps_config: Optional[dict] = None,
+    restart_state: Optional[dict] = None,
+):
     """Create an MD run configured for production (with trajectory output).
 
     Args:
         system: Starting atomic system
-        energy_fn: Energy function
+        energy_fn: Energy function (ignored when sampler_backend="lammps")
         sampler_params: Dict with keys: ensemble, thermostat, temperature,
             starting_temperature (optional), timestep, friction (optional),
             loginterval (optional, fallback)
@@ -331,9 +411,48 @@ def create_production_run(
         trajectory: Path for trajectory output
         logfile: Path for log output
         loginterval: Save frequency (overrides sampler_params if given)
+        sampler_backend: "jaxmd" (default) or "lammps"
+        lammps_config: Dict with LAMMPS-specific config (required when backend="lammps")
+        restart_state: Required dict carrying state from equilibration.
+            For jaxmd: {'state': <JAX-MD state>, 'neighbor': <neighbor list>}
+            For lammps: {'restart_file': <path to restart.lmp>}
     """
+    if restart_state is None:
+        raise ValueError(
+            "restart_state is required for create_production_run(). "
+            "Pass the equilibrated state to avoid re-initializing velocities."
+        )
+
     _loginterval = loginterval or sampler_params.get("loginterval", 100)
-    return MolecularDynamics(
+
+    if sampler_backend == "lammps":
+        from diffcg.md.lammps_sampler import LAMMPSSampler
+        lc = lammps_config or {}
+        return LAMMPSSampler(
+            system,
+            energy_params=lc.get("energy_params"),
+            energy_objects=lc.get("energy_objects"),
+            topology=lc["topology"],
+            ensemble=sampler_params["ensemble"],
+            thermostat=sampler_params["thermostat"],
+            temperature=sampler_params["temperature"],
+            timestep=sampler_params["timestep"],
+            friction=sampler_params.get("friction", 1.0),
+            cutoff=cutoff,
+            r_onset=lc.get("r_onset", cutoff * 0.8),
+            mol_ids=lc.get("mol_ids"),
+            trajectory=trajectory,
+            logfile=logfile,
+            loginterval=_loginterval,
+            lammps_exe=lc.get("lammps_exe", "lmp"),
+            work_dir=lc.get("work_dir"),
+            extra_lammps_commands=lc.get("extra_lammps_commands"),
+            input_template=lc.get("input_template"),
+            restart_file=restart_state.get("restart_file"),
+            special_bonds=lc.get("special_bonds", "lj 0.0 0.0 0.0"),
+        )
+
+    md = MolecularDynamics(
         system,
         energy_fn=energy_fn,
         ensemble=sampler_params["ensemble"],
@@ -348,4 +467,8 @@ def create_production_run(
         trajectory=trajectory,
         logfile=logfile,
         loginterval=_loginterval,
+        custom_mask_function=custom_mask_function,
     )
+    md._initial_state = restart_state.get("state")
+    md._initial_neighbor = restart_state.get("neighbor")
+    return md

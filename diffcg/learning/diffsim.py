@@ -80,8 +80,8 @@ def init_multistate_diffsim(
         states: Dict mapping state_id -> dict with keys:
             - 'init_system': AtomicSystem
             - 'r_cut': float (optional; can be omitted if a global cutoff is encoded in energy fn)
-            - 'quantity_dict': quantity spec for this state
-            - 'calculate_observables_fn': function taking trajectory path -> dict of snapshots
+            - 'quantity_dict': quantity spec for this state. Each entry must have a
+              'compute_fn' with signature (system, energy_fn=None, neighbors=None) -> array.
             - 'sampler_params': MD sampler params; must include unique 'trajectory' and 'logfile' prefixes
             - 'sim_time_scheme': dict with either
                 {'equilibration_steps': int, 'production_steps': int}
@@ -92,16 +92,20 @@ def init_multistate_diffsim(
         state_weights: Optional dict mapping state_id -> scalar weight (defaults to 1.0)
 
     Returns:
-        (generate_trajectories_fn, update_fn) where:
+        (generate_trajectories_fn, update_fn, loss_fn_by_state, compute_observables_fn) where:
             generate_trajectories_fn(params) -> traj_states dict (per state_id)
             update_fn(params, opt_state, traj_states) ->
                 (new_params, opt_state, traj_states, total_loss, per_state_losses, predictions_by_state)
+            compute_observables_fn(params, traj_states) -> dict of per-state per-frame observables
     """
 
     # Pre-build per-state helpers and metadata
     state_ids = list(states.keys())
     if state_weights is None:
         state_weights = {sid: 1.0 for sid in state_ids}
+
+    # Extract per-state custom_mask_function (if any)
+    mask_fn_by_state = {sid: states[sid].get('custom_mask_function', None) for sid in state_ids}
 
     # Output directory — read from any state or default to 'output'
     output_dir = states[state_ids[0]].get('output_dir', 'output')
@@ -133,6 +137,7 @@ def init_multistate_diffsim(
 
     def build_rerun_energy_fn_for_state(state_id):
         r_cut = states[state_id].get('r_cut', 1.0)
+        _state_mask_fn = mask_fn_by_state[state_id]
         _state_nbrs = [None]
         _state_sp = [None]
 
@@ -146,7 +151,8 @@ def init_multistate_diffsim(
 
             if _state_nbrs[0] is None or _state_sp[0] is None:
                 _state_nbrs[0], _state_sp[0] = jaxmd_neighbor_list(
-                    positions=all_R[0], cell=cell, cutoff=r_cut, capacity_multiplier=1.25
+                    positions=all_R[0], cell=cell, cutoff=r_cut, capacity_multiplier=1.25,
+                    custom_mask_function=_state_mask_fn,
                 )
 
             sp = _state_sp[0]
@@ -181,15 +187,22 @@ def init_multistate_diffsim(
 
     rerun_energy_by_state = {sid: build_rerun_energy_fn_for_state(sid) for sid in state_ids}
 
-    def _create_md_for_state_equ(state_id, start_system, sample_energy_fn):
+    def _create_md_for_state_equ(state_id, start_system, sample_energy_fn, step):
         """Create and return MD object for equilibration."""
         st = states[state_id]
+        _lc = st.get('lammps_config', None)
+        if _lc is not None:
+            _lc = dict(_lc)
+            _lc["work_dir"] = os.path.join(output_dir, f"iteration_{step}", f"lammps_equ_{state_id}")
         return create_equilibration_run(
             start_system, sample_energy_fn, st['sampler_params'],
             st.get('r_cut', 1.0),
+            custom_mask_function=mask_fn_by_state[state_id],
+            sampler_backend=st.get('sampler_backend', 'jaxmd'),
+            lammps_config=_lc,
         )
 
-    def _create_md_for_state_prd(state_id, start_system, sample_energy_fn, step):
+    def _create_md_for_state_prd(state_id, start_system, sample_energy_fn, step, restart_state=None):
         """Create and return MD object for production."""
         st = states[state_id]
         sampler_params = st['sampler_params']
@@ -197,11 +210,19 @@ def init_multistate_diffsim(
         iter_dir = os.path.join(output_dir, f"iteration_{step}")
         os.makedirs(iter_dir, exist_ok=True)
 
+        _lc = st.get('lammps_config', None)
+        if _lc is not None:
+            _lc = dict(_lc)
+            _lc["work_dir"] = os.path.join(iter_dir, f"lammps_prd_{state_id}")
         return create_production_run(
             start_system, sample_energy_fn, sampler_params, r_cut,
             trajectory=os.path.join(iter_dir, f"{sampler_params['trajectory']}{step}.traj"),
             logfile=os.path.join(iter_dir, f"{sampler_params['logfile']}{step}.log"),
             loginterval=sampler_params['loginterval'],
+            custom_mask_function=mask_fn_by_state[state_id],
+            sampler_backend=st.get('sampler_backend', 'jaxmd'),
+            lammps_config=_lc,
+            restart_state=restart_state,
         )
 
     def _run_trajectory_for_state(state_id, params, start_system: AtomicSystem, step):
@@ -221,9 +242,20 @@ def init_multistate_diffsim(
         scheme = st['sim_time_scheme']
         sample_energy_fn = build_energy_fn_with_params_fn(params, max_num_atoms=max_atoms_by_state[state_id])
 
-        md_equ = _create_md_for_state_equ(state_id, start_system, sample_energy_fn)
+        md_equ = _create_md_for_state_equ(state_id, start_system, sample_energy_fn, step)
         md_equ.run(scheme['equilibration_steps'])
-        md_prod = _create_md_for_state_prd(state_id, md_equ.get_final_system(), sample_energy_fn, step)
+
+        _backend = st.get('sampler_backend', 'jaxmd')
+        if _backend == 'lammps':
+            restart_state = {'restart_file': md_equ.get_restart_file()}
+        else:
+            restart_state = {
+                'state': md_equ.get_final_state(),
+                'neighbor': md_equ.get_final_neighbors(),
+            }
+
+        md_prod = _create_md_for_state_prd(state_id, md_equ.get_final_system(), sample_energy_fn, step,
+                                           restart_state=restart_state)
         md_prod.run(scheme['production_steps'])
         trajs = md_prod.get_trajectory()
         ref_energies = rerun_energy_by_state[state_id](params, trajs)
@@ -237,29 +269,33 @@ def init_multistate_diffsim(
         for sid in state_ids:
             logger.debug(f"[state={sid}] Generating initial trajectory")
             traj_states[sid] = _run_trajectory_for_state(sid, params, states[sid]['init_system'], step)
+        _step_counter[0] += 1
         return traj_states
 
     def update_fn(params, opt_state, traj_states):
-        """Single multistate reweighting optimization step."""
+        """Single multistate reweighting optimization step.
+
+        Algorithm (matching notebook and single-state update_fn):
+          1. Check n_eff with current params → recompute trajectory if needed
+          2. Compute observables from (possibly fresh) trajectory
+          3. Compute weighted loss + gradient
+          4. Update params
+        """
         step = _step_counter[0]
 
-        per_state_context = {}
+        # --- Step 1: Check n_eff per state, recompute if needed ---
         for sid in state_ids:
-            st = states[sid]
-            sampler_params = st['sampler_params']
             trajs = traj_states[sid]['trajs']
             ref_energies = traj_states[sid]['ref_energies']
+            sampler_params = states[sid]['sampler_params']
 
-            # Build estimator from stored reference energies
+            curr_energies = rerun_energy_by_state[sid](params, trajs)
             estimator = ReweightEstimator(
                 ref_energies,
                 kBT=sampler_params['temperature'] * Boltzmann_constant,
                 base_energies=None,
                 volume=None,
             )
-
-            # Check n_eff with current params to decide recompute
-            curr_energies = rerun_energy_by_state[sid](params, trajs)
             _, n_eff = estimator.estimate_weight(curr_energies)
             recompute = n_eff < reweight_ratio * len(trajs)
 
@@ -267,34 +303,19 @@ def init_multistate_diffsim(
                 logger.debug(
                     f"[state={sid}] Recomputing trajectory (step={step}) because n_eff = {n_eff} < {reweight_ratio * len(trajs)}"
                 )
-                # Use last frame as starting point
                 new_system = trajs[-1]
                 traj_states[sid] = _run_trajectory_for_state(sid, params, new_system, step)
-                trajs = traj_states[sid]['trajs']
-                ref_energies = traj_states[sid]['ref_energies']
-                estimator = ReweightEstimator(
-                    ref_energies,
-                    kBT=sampler_params['temperature'] * Boltzmann_constant,
-                    base_energies=None,
-                    volume=None,
-                )
+
+        # --- Step 2: Build per-state context from (possibly fresh) trajectories ---
+        per_state_context = {}
+        for sid in state_ids:
+            trajs = traj_states[sid]['trajs']
 
             per_state_context[sid] = {
                 'trajs': trajs,
-                'estimator': estimator,
                 'loss_fn': loss_fn_by_state[sid],
                 'weight': state_weights.get(sid, 1.0),
             }
-
-        # Compute observables for each state from in-memory trajectories
-        iter_dir = os.path.join(output_dir, f"iteration_{step}")
-        observables_by_state = {
-            sid: states[sid]['calculate_observables_fn'](
-                os.path.join(iter_dir, f"{states[sid]['sampler_params']['trajectory']}{step}.traj"),
-                batched_systems=per_state_context[sid]['trajs'].to_batched_system(),
-            )
-            for sid in state_ids
-        }
 
         # Pre-compute per-state constants for inline weight computation (outside gradient path)
         grad_context_by_state = {}
@@ -311,7 +332,8 @@ def init_multistate_diffsim(
 
             # Initialize neighbor lists for gradient computation
             nbrs_sid, sp_sid = jaxmd_neighbor_list(
-                positions=all_R_sid[0], cell=cell_sid, cutoff=r_cut_sid, capacity_multiplier=1.25
+                positions=all_R_sid[0], cell=cell_sid, cutoff=r_cut_sid, capacity_multiplier=1.25,
+                custom_mask_function=mask_fn_by_state[sid],
             )
 
             kBT_sid = sampler_params_sid['temperature'] * Boltzmann_constant
@@ -341,15 +363,20 @@ def init_multistate_diffsim(
             for sid in state_ids:
                 gctx = grad_context_by_state[sid]
                 energy_fn = build_energy_fn_with_params_fn(p, max_num_atoms=gctx['max_num_atoms'])
+                _quantity_dict_sid = states[sid]['quantity_dict']
 
-                # Compute energies inline (no @jax.jit barrier)
-                def body_fn(nbrs, R_i, _sp=gctx['sp'], _z=gctx['z'], _cell=gctx['cell']):
+                # Compute energies + observables inline (no @jax.jit barrier)
+                def body_fn(nbrs, R_i, _sp=gctx['sp'], _z=gctx['z'], _cell=gctx['cell'],
+                            _qd=_quantity_dict_sid):
                     nbrs_i = _sp.neighbor_fn.update(R_i, nbrs)
                     system_i = System(R=R_i, Z=_z, cell=_cell)
                     e_i = energy_fn(system_i, nbrs_i)
-                    return nbrs_i, e_i
+                    obs_i = {}
+                    for qkey, qspec in _qd.items():
+                        obs_i[qkey] = qspec['compute_fn'](system_i, energy_fn=energy_fn, neighbors=nbrs_i)
+                    return nbrs_i, (e_i, obs_i)
 
-                _, energies_new = jax.lax.scan(body_fn, gctx['nbrs'], gctx['all_R'])
+                _, (energies_new, obs_per_frame) = jax.lax.scan(body_fn, gctx['nbrs'], gctx['all_R'])
 
                 # Inline weight computation
                 log_weights = -(1.0 / gctx['kBT']) * (energies_new - gctx['ref_energies'])
@@ -357,7 +384,7 @@ def init_multistate_diffsim(
                 prob_ratios = jnp.exp(log_weights)
                 weights = prob_ratios / jnp.sum(prob_ratios)
 
-                loss_val, predictions = per_state_context[sid]['loss_fn'](observables_by_state[sid], weights)
+                loss_val, predictions = per_state_context[sid]['loss_fn'](obs_per_frame, weights)
                 predictions_by_state[sid] = predictions
                 per_state_losses[sid] = loss_val
 
@@ -380,13 +407,50 @@ def init_multistate_diffsim(
         _step_counter[0] += 1
         return new_params, opt_state_new, traj_states, total_loss, per_state_losses, predictions_by_state
 
-    return generate_trajectories_fn, update_fn
+    def compute_observables_fn(params, traj_states):
+        """Compute per-frame observables for all states (outside gradient tape).
+
+        Used for initial predictions before the optimization loop.
+        """
+        result = {}
+        for sid in state_ids:
+            trajs = traj_states[sid]['trajs']
+            r_cut_sid = states[sid].get('r_cut', 1.0)
+            dtype = jnp.float64
+            all_R = trajs.positions.astype(dtype)
+            z = trajs.Z.astype(jnp.int16)
+            cell = trajs.cell.astype(dtype) if trajs.cell is not None else None
+
+            nbrs_sid, sp_sid = jaxmd_neighbor_list(
+                positions=all_R[0], cell=cell, cutoff=r_cut_sid, capacity_multiplier=1.25,
+                custom_mask_function=mask_fn_by_state[sid],
+            )
+            energy_fn = build_energy_fn_with_params_fn(params, max_num_atoms=max_atoms_by_state[sid])
+            _qd = states[sid]['quantity_dict']
+
+            def _scan_obs(all_positions, _energy_fn=energy_fn, _z=z, _cell=cell,
+                          _sp=sp_sid, _nbrs=nbrs_sid, _qd_inner=_qd):
+                def body_fn(nbrs_carry, R_i):
+                    nbrs_i = _sp.neighbor_fn.update(R_i, nbrs_carry)
+                    system_i = System(R=R_i, Z=_z, cell=_cell)
+                    obs_i = {}
+                    for qkey, qspec in _qd_inner.items():
+                        obs_i[qkey] = qspec['compute_fn'](system_i, energy_fn=_energy_fn, neighbors=nbrs_i)
+                    return nbrs_i, obs_i
+                _, obs = jax.lax.scan(body_fn, _nbrs, all_positions)
+                return obs
+
+            result[sid] = jax.jit(_scan_obs)(all_R)
+        return result
+
+    return generate_trajectories_fn, update_fn, loss_fn_by_state, compute_observables_fn
 
 
 def optimize_multistate_diffsim(generate_trajectories_fn, update_fn, params, total_iterations, *,
                                  states=None, quantity_dicts=None,
                                  output_dir="output", save_figures=False,
-                                 optimizer=None):
+                                 optimizer=None, loss_fn_by_state=None,
+                                 compute_observables_fn=None):
     """
     Convenience optimizer loop for the multistate DiffSim update function.
 
@@ -401,6 +465,21 @@ def optimize_multistate_diffsim(generate_trajectories_fn, update_fn, params, tot
         opt_state = optimizer.init(params)
     else:
         raise ValueError("optimizer is required for optimize_multistate_diffsim")
+
+    # Compute and save initial observables (uniform weights since params == generating params)
+    if save_figures and quantity_dicts is not None and loss_fn_by_state is not None and compute_observables_fn is not None:
+        from diffcg._core.visualization import save_multistate_iteration_figures
+        init_obs_by_state = compute_observables_fn(params, traj_states)
+        init_predictions = {}
+        for sid, traj_st in traj_states.items():
+            n_frames = len(traj_st['trajs'])
+            uniform_weights = jnp.ones(n_frames) / n_frames
+            _, preds = loss_fn_by_state[sid](init_obs_by_state[sid], uniform_weights)
+            init_predictions[sid] = preds
+        save_multistate_iteration_figures(
+            0, init_predictions, states, quantity_dicts, [], [], output_dir
+        )
+        logger.info("Saved initial multistate observable figures to iteration_0")
 
     loss_history = []
     times_per_update = []
@@ -435,7 +514,7 @@ def optimize_multistate_diffsim(generate_trajectories_fn, update_fn, params, tot
         if save_figures and quantity_dicts is not None:
             from diffcg._core.visualization import save_multistate_iteration_figures
             save_multistate_iteration_figures(
-                step, predictions, states, quantity_dicts,
+                step + 1, predictions, states, quantity_dicts,
                 loss_history, per_state_loss_history, output_dir
             )
 
@@ -458,8 +537,8 @@ def init_diffsim(
         state: Dict with keys:
             - 'init_system': AtomicSystem
             - 'r_cut': float (optional)
-            - 'quantity_dict': quantity spec for this state
-            - 'calculate_observables_fn': function taking trajectory path -> dict of snapshots
+            - 'quantity_dict': quantity spec for this state. Each entry must have a
+              'compute_fn' with signature (system, energy_fn=None, neighbors=None) -> array.
             - 'sampler_params': MD sampler params; must include 'trajectory' and 'logfile' prefixes
             - 'sim_time_scheme': dict with either
                 {'equilibration_steps': int, 'production_steps': int}
@@ -469,10 +548,11 @@ def init_diffsim(
         Boltzmann_constant: float in kJ/(mol*K)
 
     Returns:
-        (generate_trajectory_fn, update_fn) where:
+        (generate_trajectory_fn, update_fn, compute_observables_fn) where:
             generate_trajectory_fn(params) -> traj_state dict
             update_fn(params, opt_state, traj_state) ->
                 (new_params, opt_state, traj_state, loss, predictions)
+            compute_observables_fn(params, traj) -> dict of per-frame observables
     """
 
     # Prepare reusable elements
@@ -480,27 +560,47 @@ def init_diffsim(
     init_system = state['init_system']
     max_num_atoms = init_system.n_atoms
     output_dir = state.get('output_dir', 'output')
+    _custom_mask_function = state.get('custom_mask_function', None)
 
     # Mutable counter for logging iteration directories
     _step_counter = [0]
 
     _r_cut = state.get('r_cut', 1.0)
+    _sampler_backend = state.get('sampler_backend', 'jaxmd')
+    _lammps_config = state.get('lammps_config', None)
 
-    def _create_md_equ(start_system, sample_energy_fn):
+    def _create_md_equ(start_system, sample_energy_fn, step):
+        if _lammps_config is not None:
+            lc = dict(_lammps_config)
+            lc["work_dir"] = os.path.join(output_dir, f"iteration_{step}", "lammps_equ")
+        else:
+            lc = None
         return create_equilibration_run(
             start_system, sample_energy_fn, state['sampler_params'], _r_cut,
+            custom_mask_function=_custom_mask_function,
+            sampler_backend=_sampler_backend,
+            lammps_config=lc,
         )
 
-    def _create_md_prd(start_system, sample_energy_fn, step):
+    def _create_md_prd(start_system, sample_energy_fn, step, restart_state=None):
         sampler_params = state['sampler_params']
         iter_dir = os.path.join(output_dir, f"iteration_{step}")
         os.makedirs(iter_dir, exist_ok=True)
 
+        if _lammps_config is not None:
+            lc = dict(_lammps_config)
+            lc["work_dir"] = os.path.join(iter_dir, "lammps_prd")
+        else:
+            lc = None
         return create_production_run(
             start_system, sample_energy_fn, sampler_params, _r_cut,
             trajectory=os.path.join(iter_dir, f"{sampler_params['trajectory']}{step}.traj"),
             logfile=os.path.join(iter_dir, f"{sampler_params['logfile']}{step}.log"),
             loginterval=sampler_params['loginterval'],
+            custom_mask_function=_custom_mask_function,
+            sampler_backend=_sampler_backend,
+            lammps_config=lc,
+            restart_state=restart_state,
         )
 
     _rerun_nbrs = None
@@ -519,7 +619,8 @@ def init_diffsim(
         # Allocate neighbor list once (reuse across calls if possible)
         if _rerun_nbrs is None or _rerun_sp is None:
             _rerun_nbrs, _rerun_sp = jaxmd_neighbor_list(
-                positions=all_R[0], cell=cell, cutoff=r_cut, capacity_multiplier=1.25
+                positions=all_R[0], cell=cell, cutoff=r_cut, capacity_multiplier=1.25,
+                custom_mask_function=_custom_mask_function,
             )
 
         @jax.jit
@@ -565,9 +666,19 @@ def init_diffsim(
         scheme = state['sim_time_scheme']
         sample_energy_fn = build_energy_fn_with_params_fn(params, max_num_atoms=max_num_atoms)
 
-        md_equ = _create_md_equ(start_system, sample_energy_fn)
+        md_equ = _create_md_equ(start_system, sample_energy_fn, step)
         md_equ.run(scheme['equilibration_steps'])
-        md_prod = _create_md_prd(md_equ.get_final_system(), sample_energy_fn, step)
+
+        if _sampler_backend == 'lammps':
+            restart_state = {'restart_file': md_equ.get_restart_file()}
+        else:
+            restart_state = {
+                'state': md_equ.get_final_state(),
+                'neighbor': md_equ.get_final_neighbors(),
+            }
+
+        md_prod = _create_md_prd(md_equ.get_final_system(), sample_energy_fn, step,
+                                 restart_state=restart_state)
         md_prod.run(scheme['production_steps'])
         trajs = md_prod.get_trajectory()
         ref_energies = rerun_energy(params, trajs)
@@ -579,26 +690,68 @@ def init_diffsim(
         step = _step_counter[0]
         logger.debug(f"Generating initial trajectory (step={step})")
         traj_state = _run_trajectory(params, init_system, step)
+        _step_counter[0] += 1
         return traj_state
 
+    def _compute_observables(quantity_dict, energy_fn, all_R, z, cell, nbrs, sp):
+        """Scan over frames computing all observables. Used for initial predictions."""
+        def body_fn(nbrs_carry, R_i):
+            nbrs_i = sp.neighbor_fn.update(R_i, nbrs_carry)
+            system_i = System(R=R_i, Z=z, cell=cell)
+            obs_i = {}
+            for qkey, qspec in quantity_dict.items():
+                obs_i[qkey] = qspec['compute_fn'](system_i, energy_fn=energy_fn, neighbors=nbrs_i)
+            return nbrs_i, obs_i
+
+        _, obs_per_frame = jax.lax.scan(body_fn, nbrs, all_R)
+        return obs_per_frame
+
+    def compute_observables_fn(params, traj: Trajectory):
+        """Compute per-frame observables for a trajectory (outside gradient tape).
+
+        Used for initial predictions before the optimization loop.
+        """
+        nonlocal _rerun_nbrs, _rerun_sp
+        energy_fn = build_energy_fn_with_params_fn(params, max_num_atoms=max_num_atoms)
+        r_cut = state.get('r_cut', 1.0)
+        dtype = jnp.float64
+
+        all_R = traj.positions.astype(dtype)
+        z = traj.Z.astype(jnp.int16)
+        cell = traj.cell.astype(dtype) if traj.cell is not None else None
+
+        if _rerun_nbrs is None or _rerun_sp is None:
+            _rerun_nbrs, _rerun_sp = jaxmd_neighbor_list(
+                positions=all_R[0], cell=cell, cutoff=r_cut, capacity_multiplier=1.25,
+                custom_mask_function=_custom_mask_function,
+            )
+
+        return jax.jit(lambda aR: _compute_observables(
+            state['quantity_dict'], energy_fn, aR, z, cell, _rerun_nbrs, _rerun_sp
+        ))(all_R)
+
     def update_fn(params, opt_state, traj_state):
-        """Single reweighting optimization step."""
+        """Single reweighting optimization step.
+
+        Algorithm:
+          1. Check n_eff with current params → recompute trajectory if too low
+          2. Compute weighted loss + gradient (observables computed inside value_and_grad)
+          3. Update params
+        """
         nonlocal _rerun_nbrs, _rerun_sp
         step = _step_counter[0]
         sampler_params = state['sampler_params']
+
+        # --- Step 1: Check n_eff and possibly recompute trajectory ---
         trajs = traj_state['trajs']
         ref_energies = traj_state['ref_energies']
-
-        # Build estimator from stored reference energies
+        curr_energies = rerun_energy(params, trajs)
         estimator = ReweightEstimator(
             ref_energies,
             kBT=sampler_params['temperature'] * Boltzmann_constant,
             base_energies=None,
             volume=None,
         )
-
-        # Check n_eff with current params to decide recompute
-        curr_energies = rerun_energy(params, trajs)
         _, n_eff = estimator.estimate_weight(curr_energies)
         recompute = n_eff < reweight_ratio * len(trajs)
 
@@ -606,30 +759,14 @@ def init_diffsim(
             logger.debug(
                 f"Recomputing trajectory (step={step}) because n_eff = {n_eff} < {reweight_ratio * len(trajs)}"
             )
-            # Use last frame as starting point
             new_system = trajs[-1]
             traj_state = _run_trajectory(params, new_system, step)
-            trajs = traj_state['trajs']
-            ref_energies = traj_state['ref_energies']
-            estimator = ReweightEstimator(
-                ref_energies,
-                kBT=sampler_params['temperature'] * Boltzmann_constant,
-                base_energies=None,
-                volume=None,
-            )
 
-        # Build batched_systems from Trajectory for observables
-        batched_systems = trajs.to_batched_system()
+        # Re-read (possibly updated) trajectory state
+        trajs = traj_state['trajs']
+        ref_energies = traj_state['ref_energies']
 
-        # Compute observables — pass batched_systems to avoid disk read
-        iter_dir = os.path.join(output_dir, f"iteration_{step}")
-        traj_path = os.path.join(iter_dir, f"{sampler_params['trajectory']}{step}.traj")
-        observables = state['calculate_observables_fn'](
-            traj_path,
-            batched_systems=batched_systems,
-        )
-
-        # Pre-compute constants for inline weight computation (outside gradient path)
+        # --- Step 2: Compute weighted loss + gradient ---
         kBT = sampler_params['temperature'] * Boltzmann_constant
         dtype = jnp.float64
         all_R = trajs.positions.astype(dtype)
@@ -639,48 +776,50 @@ def init_diffsim(
         r_cut = state.get('r_cut', 1.0)
         if _rerun_nbrs is None or _rerun_sp is None:
             _rerun_nbrs, _rerun_sp = jaxmd_neighbor_list(
-                positions=all_R[0], cell=cell_arr, cutoff=r_cut, capacity_multiplier=1.25
+                positions=all_R[0], cell=cell_arr, cutoff=r_cut, capacity_multiplier=1.25,
+                custom_mask_function=_custom_mask_function,
             )
 
-        # Capture neighbor list init for use inside wrapped_loss (constant w.r.t. params)
         nbrs_for_grad = _rerun_nbrs
         sp_for_grad = _rerun_sp
-
-        def _compute_energies_for_grad(energy_fn, positions, atomic_numbers, cell, nbrs_init):
-            """Compute per-frame energies for use inside value_and_grad."""
-            def body_fn(nbrs, R_i):
-                nbrs_i = sp_for_grad.neighbor_fn.update(R_i, nbrs)
-                system_i = System(R=R_i, Z=atomic_numbers, cell=cell)
-                e_i = energy_fn(system_i, nbrs_i)
-                return nbrs_i, e_i
-
-            _, energies = jax.lax.scan(body_fn, nbrs_init, positions)
-            return energies
+        _quantity_dict = state['quantity_dict']
 
         def wrapped_loss(p):
             energy_fn = build_energy_fn_with_params_fn(p, max_num_atoms=max_num_atoms)
-            energies_new = _compute_energies_for_grad(energy_fn, all_R, z, cell_arr, nbrs_for_grad)
-            # Inline weight computation (matching notebook pattern)
+
+            def body_fn(nbrs, R_i):
+                nbrs_i = sp_for_grad.neighbor_fn.update(R_i, nbrs)
+                system_i = System(R=R_i, Z=z, cell=cell_arr)
+                e_i = energy_fn(system_i, nbrs_i)
+                obs_i = {}
+                for qkey, qspec in _quantity_dict.items():
+                    obs_i[qkey] = qspec['compute_fn'](system_i, energy_fn=energy_fn, neighbors=nbrs_i)
+                return nbrs_i, (e_i, obs_i)
+
+            _, (energies_new, obs_per_frame) = jax.lax.scan(body_fn, nbrs_for_grad, all_R)
+
             log_weights = -(1.0 / kBT) * (energies_new - ref_energies)
             log_weights = log_weights - jnp.max(log_weights)
             prob_ratios = jnp.exp(log_weights)
             weights = prob_ratios / jnp.sum(prob_ratios)
-            return loss_fn(observables, weights)
+            return loss_fn(obs_per_frame, weights)
 
         v_and_g = value_and_grad(wrapped_loss, has_aux=True)
         (loss_val, predictions), grad = v_and_g(params)
+
+        # --- Step 3: Update params ---
         scaled_grad, opt_state_new = optimizer.update(grad, opt_state, params)
         new_params = optax.apply_updates(params, scaled_grad)
 
         _step_counter[0] += 1
         return new_params, opt_state_new, traj_state, loss_val, predictions
 
-    return generate_trajectory_fn, update_fn
+    return generate_trajectory_fn, update_fn, compute_observables_fn
 
 
 def optimize_diffsim(generate_trajectory_fn, update_fn, params, total_iterations, *,
                      quantity_dict=None, output_dir="output", save_figures=False,
-                     optimizer=None):
+                     optimizer=None, compute_observables_fn=None, loss_fn=None):
     """
     Convenience optimizer loop for single-state DiffSim update function.
 
@@ -695,8 +834,18 @@ def optimize_diffsim(generate_trajectory_fn, update_fn, params, total_iterations
     if optimizer is not None:
         opt_state = optimizer.init(params)
     else:
-        # Fallback: optimizer must be passed
         raise ValueError("optimizer is required for optimize_diffsim")
+
+    # Compute and save initial observables (uniform weights since params == generating params)
+    if save_figures and quantity_dict is not None and compute_observables_fn is not None and loss_fn is not None:
+        from diffcg._core.visualization import save_iteration_figures
+        trajs_init = traj_state['trajs']
+        init_observables = compute_observables_fn(params, trajs_init)
+        n_frames = len(trajs_init)
+        uniform_weights = jnp.ones(n_frames) / n_frames
+        _, init_predictions = loss_fn(init_observables, uniform_weights)
+        save_iteration_figures(0, init_predictions, quantity_dict, [], output_dir)
+        logger.info("Saved initial observable figures to iteration_0")
 
     loss_history = []
     times_per_update = []
@@ -726,6 +875,6 @@ def optimize_diffsim(generate_trajectory_fn, update_fn, params, total_iterations
         # Save figures if enabled
         if save_figures and quantity_dict is not None:
             from diffcg._core.visualization import save_iteration_figures
-            save_iteration_figures(step, predictions, quantity_dict, loss_history, output_dir)
+            save_iteration_figures(step + 1, predictions, quantity_dict, loss_history, output_dir)
 
     return loss_history, times_per_update, predictions_history, params_set

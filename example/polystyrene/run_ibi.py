@@ -14,7 +14,7 @@ from diffcg import configure_logging
 from diffcg.learning.ibi import IBITargets, IBIConfig, IterativeBoltzmannInversion
 
 from common import (
-    load_targets, load_system,
+    load_targets, load_system, build_exclusion_mask,
     BOLTZMANN_CONSTANT,
 )
 
@@ -65,13 +65,14 @@ cfg = IBIConfig(
     logfile_prefix="ibi_ps_",
 )
 
+custom_mask_function = build_exclusion_mask(topology, exclusion_level=3)
+
 ibi = IterativeBoltzmannInversion(
     kBT=Temperature * BOLTZMANN_CONSTANT,
     system=init_system,
     targets=targets,
     config=cfg,
-    mask_topology=topology["angle"],
-    max_num_atoms=init_system.n_atoms,
+    custom_mask_function=custom_mask_function,
 )
 
 # ── Run IBI ────────────────────────────────────────────────────────────

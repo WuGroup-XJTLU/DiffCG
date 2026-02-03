@@ -14,6 +14,7 @@ Conventions:
 from jax import vmap
 import jax.numpy as jnp
 from functools import partial
+from jax_md import space
 
 
 def cast(x):
@@ -41,10 +42,6 @@ def _to_frac(cell, R):
     return jnp.einsum("Aa,a->A", inverse(cell), R)
 
 
-def _to_frac_with_inv(cell_inv, R):
-    """Convert to fractional coords using pre-computed cell inverse."""
-    return jnp.einsum("Aa,a->A", cell_inv, R)
-
 
 def to_frac(cell, R):
     return vmap(partial(_to_frac, cell))(R)
@@ -58,48 +55,26 @@ def from_frac(cell, X):
     return vmap(partial(_from_frac, cell))(X)
 
 
-def make_displacement(cell):
-    return partial(displacement, cell)
+def get_displacement_fn(cell):
+    """Create JAX-MD displacement function from cell matrix.
 
-
-def make_displacement_with_cached_inverse(cell):
-    """Create displacement function with pre-computed cell inverse.
-
-    This is more efficient than make_displacement when the cell doesn't change
-    and displacement is called many times.
+    NOTE: Returns JAX-MD convention: disp_fn(Ra, Rb) = Ra - Rb.
+    This is opposite to the old DiffCG convention (Rb - Ra).
+    Call sites using directional displacements (angles, dihedrals)
+    must swap argument order to preserve behavior.
 
     Args:
-        cell: (D, D) cell matrix or None for non-periodic
+        cell: (D, D) cell matrix (lattice vectors as columns) or None for non-periodic.
 
     Returns:
-        displacement_fn(Ra, Rb) -> displacement vector
+        displacement_fn(Ra, Rb) -> Ra - Rb (with periodic wrapping if cell given)
     """
     if cell is None:
-        def displacement_fast(Ra, Rb):
-            return Rb - Ra
-        return displacement_fast
-
-    cell_inv = jnp.linalg.inv(cell)
-
-    def displacement_fast(Ra, Rb):
-        R = Rb - Ra
-        X = _to_frac_with_inv(cell_inv, R)
-        X = jnp.mod(X + cast(0.5), cast(1.0)) - cast(0.5)
-        return _from_frac(cell, X)
-
-    return displacement_fast
-
-
-def displacement(cell, Ra, Rb):
-    if cell is None:
-        return Rb - Ra
-
+        disp_fn, _ = space.free()
     else:
-        R = Rb - Ra
-        X = _to_frac(cell, R)
-        X = jnp.mod(X + cast(0.5), cast(1.0)) - cast(0.5)
+        disp_fn, _ = space.periodic_general(cell.T, fractional_coordinates=False)
+    return disp_fn
 
-        return _from_frac(cell, X)
 
 
 def wrap(cell, R):
