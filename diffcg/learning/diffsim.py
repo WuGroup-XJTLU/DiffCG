@@ -796,7 +796,8 @@ def init_diffsim(
                     obs_i[qkey] = qspec['compute_fn'](system_i, energy_fn=energy_fn, neighbors=nbrs_i)
                 return nbrs_i, (e_i, obs_i)
 
-            _, (energies_new, obs_per_frame) = jax.lax.scan(body_fn, nbrs_for_grad, all_R)
+            body_fn_remat = jax.checkpoint(body_fn)
+            _, (energies_new, obs_per_frame) = jax.lax.scan(body_fn_remat, nbrs_for_grad, all_R)
 
             log_weights = -(1.0 / kBT) * (energies_new - ref_energies)
             log_weights = log_weights - jnp.max(log_weights)
