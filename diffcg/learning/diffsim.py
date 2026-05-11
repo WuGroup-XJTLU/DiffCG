@@ -376,7 +376,8 @@ def init_multistate_diffsim(
                         obs_i[qkey] = qspec['compute_fn'](system_i, energy_fn=energy_fn, neighbors=nbrs_i)
                     return nbrs_i, (e_i, obs_i)
 
-                _, (energies_new, obs_per_frame) = jax.lax.scan(body_fn, gctx['nbrs'], gctx['all_R'])
+                body_fn_remat = jax.checkpoint(body_fn)
+                _, (energies_new, obs_per_frame) = jax.lax.scan(body_fn_remat, gctx['nbrs'], gctx['all_R'])
 
                 # Inline weight computation
                 log_weights = -(1.0 / gctx['kBT']) * (energies_new - gctx['ref_energies'])
