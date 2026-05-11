@@ -68,6 +68,7 @@ def init_multistate_diffsim(
     Boltzmann_constant: float = BOLTZMANN_KJMOLK,
     state_weights: Optional[dict] = None,
     multiobj = None,
+    regularizer_fn=None,
 ):
     """
     Initialize a multistate DiffSim trajectory generator and update function.
@@ -398,6 +399,8 @@ def init_multistate_diffsim(
                 # Original simple weighted sum
                 total_loss = sum(state_weights.get(sid, 1.0) * loss_val
                                 for sid, loss_val in per_state_losses.items())
+            if regularizer_fn is not None:
+                total_loss = total_loss + regularizer_fn(p)
             return total_loss, (per_state_losses, predictions_by_state)
 
         v_and_g = value_and_grad(wrapped_total_loss_fn, has_aux=True)
