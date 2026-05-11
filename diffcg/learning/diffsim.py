@@ -529,6 +529,7 @@ def init_diffsim(
     build_energy_fn_with_params_fn,
     optimizer,
     Boltzmann_constant: float = BOLTZMANN_KJMOLK,
+    regularizer_fn=None,
 ):
     """
     Initialize a single-state DiffSim trajectory generator and update function (functional API).
@@ -804,7 +805,10 @@ def init_diffsim(
             log_weights = log_weights - jnp.max(log_weights)
             prob_ratios = jnp.exp(log_weights)
             weights = prob_ratios / jnp.sum(prob_ratios)
-            return loss_fn(obs_per_frame, weights)
+            loss_val, predictions = loss_fn(obs_per_frame, weights)
+            if regularizer_fn is not None:
+                loss_val = loss_val + regularizer_fn(p)
+            return loss_val, predictions
 
         v_and_g = value_and_grad(wrapped_loss, has_aux=True)
         (loss_val, predictions), grad = v_and_g(params)
