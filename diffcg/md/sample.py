@@ -19,6 +19,7 @@ from jax import random
 
 from diffcg.system import AtomicSystem, Trajectory, System
 from diffcg.md.jaxmd_sampler import JAXMDSampler, MDResult
+from diffcg.md.fastmd_sampler import FastMDSampler
 from diffcg._core.logger import get_logger
 from diffcg._core.constants import BOLTZMANN_KJMOLK
 
@@ -367,6 +368,29 @@ def create_equilibration_run(
             special_bonds=lc.get("special_bonds", "lj 0.0 0.0 0.0"),
         )
 
+    if sampler_backend == "fastmd":
+        fc = lammps_config or {}
+        return FastMDSampler(
+            system,
+            energy_params=fc.get("energy_params"),
+            energy_objects=fc.get("energy_objects"),
+            topology=fc["topology"],
+            ensemble=sampler_params["ensemble"],
+            thermostat=sampler_params["thermostat"],
+            temperature=sampler_params["temperature"],
+            timestep=sampler_params["timestep"],
+            friction=sampler_params.get("friction", 1.0),
+            cutoff=cutoff,
+            r_onset=fc.get("r_onset", cutoff * 0.8),
+            mol_ids=fc.get("mol_ids"),
+            trajectory=None,
+            logfile=None,
+            loginterval=_loginterval,
+            fastmd_exe=fc.get("fastmd_exe", "fastmd"),
+            work_dir=fc.get("work_dir"),
+            random_seed=sampler_params.get("seed", 0),
+        )
+
     return MolecularDynamics(
         system,
         energy_fn=energy_fn,
@@ -450,6 +474,29 @@ def create_production_run(
             input_template=lc.get("input_template"),
             restart_file=restart_state.get("restart_file"),
             special_bonds=lc.get("special_bonds", "lj 0.0 0.0 0.0"),
+        )
+
+    if sampler_backend == "fastmd":
+        fc = lammps_config or {}
+        return FastMDSampler(
+            system,
+            energy_params=fc.get("energy_params"),
+            energy_objects=fc.get("energy_objects"),
+            topology=fc["topology"],
+            ensemble=sampler_params["ensemble"],
+            thermostat=sampler_params["thermostat"],
+            temperature=sampler_params["temperature"],
+            timestep=sampler_params["timestep"],
+            friction=sampler_params.get("friction", 1.0),
+            cutoff=cutoff,
+            r_onset=fc.get("r_onset", cutoff * 0.8),
+            mol_ids=fc.get("mol_ids"),
+            trajectory=trajectory,
+            logfile=logfile,
+            loginterval=_loginterval,
+            fastmd_exe=fc.get("fastmd_exe", "fastmd"),
+            work_dir=fc.get("work_dir"),
+            random_seed=sampler_params.get("seed", 0),
         )
 
     md = MolecularDynamics(
