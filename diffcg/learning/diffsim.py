@@ -248,6 +248,8 @@ def init_multistate_diffsim(
         _backend = st.get('sampler_backend', 'jaxmd')
         if _backend == 'lammps':
             restart_state = {'restart_file': md_equ.get_restart_file()}
+        elif _backend == 'fastmd':
+            restart_state = {}
         else:
             restart_state = {
                 'state': md_equ.get_final_state(),
@@ -672,6 +674,8 @@ def init_diffsim(
 
         if _sampler_backend == 'lammps':
             restart_state = {'restart_file': md_equ.get_restart_file()}
+        elif _sampler_backend == 'fastmd':
+            restart_state = {}
         else:
             restart_state = {
                 'state': md_equ.get_final_state(),
