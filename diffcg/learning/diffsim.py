@@ -535,6 +535,7 @@ def init_diffsim(
     optimizer,
     Boltzmann_constant: float = BOLTZMANN_KJMOLK,
     regularizer_fn=None,
+    start_step=0,
 ):
     """
     Initialize a single-state DiffSim trajectory generator and update function (functional API).
@@ -553,6 +554,8 @@ def init_diffsim(
         build_energy_fn_with_params_fn: Callable (params, max_num_atoms) -> energy_fn
         optimizer: optax optimizer
         Boltzmann_constant: float in kJ/(mol*K)
+        start_step: Starting step number for iteration folder naming. Default 0.
+            Set to N+1 when resuming from checkpoint at iteration N.
 
     Returns:
         (generate_trajectory_fn, update_fn, compute_observables_fn) where:
@@ -570,7 +573,7 @@ def init_diffsim(
     _custom_mask_function = state.get('custom_mask_function', None)
 
     # Mutable counter for logging iteration directories
-    _step_counter = [0]
+    _step_counter = [start_step]
 
     _r_cut = state.get('r_cut', 1.0)
     _sampler_backend = state.get('sampler_backend', 'jaxmd')
@@ -820,9 +823,19 @@ def init_diffsim(
         v_and_g = value_and_grad(wrapped_loss, has_aux=True)
         (loss_val, predictions), grad = v_and_g(params)
 
+        # --- Diagnostic logging ---
+        grad_leaves = jax.tree_util.tree_leaves(grad)
+        grad_norm = jnp.sqrt(sum(jnp.sum(g ** 2) for g in grad_leaves))
+        logger.info(f"Step {step} | grad_norm = {grad_norm:.6f}")
+
         # --- Step 3: Update params ---
         scaled_grad, opt_state_new = optimizer.update(grad, opt_state, params)
         new_params = optax.apply_updates(params, scaled_grad)
+
+        param_leaves_new = jax.tree_util.tree_leaves(new_params)
+        param_leaves_old = jax.tree_util.tree_leaves(params)
+        param_delta_norm = jnp.sqrt(sum(jnp.sum((n - o) ** 2) for n, o in zip(param_leaves_new, param_leaves_old)))
+        logger.info(f"Step {step} | param_delta_norm = {param_delta_norm:.6f}")
 
         _step_counter[0] += 1
         return new_params, opt_state_new, traj_state, loss_val, predictions
@@ -884,6 +897,12 @@ def optimize_diffsim(generate_trajectory_fn, update_fn, params, total_iterations
         times_per_update.append(step_time)
         predictions_history.append(predictions)
         params_set.append(params_before)
+
+        # Save parameters for post-run diagnostics
+        iter_dir = os.path.join(output_dir, f"iteration_{step+1}")
+        os.makedirs(iter_dir, exist_ok=True)
+        np.savez(os.path.join(iter_dir, "params.npz"),
+                 pair=np.asarray(params["pair"]))
 
         # Save figures if enabled
         if save_figures and quantity_dict is not None:
