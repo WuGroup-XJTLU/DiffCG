@@ -10,6 +10,7 @@ import os
 import subprocess
 import tempfile
 from collections import defaultdict
+from dataclasses import replace
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -430,7 +431,10 @@ class FastMDSampler:
     def get_final_system(self) -> AtomicSystem:
         """Return the system at the final frame of the last trajectory."""
         if self._last_trajectory is not None and len(self._last_trajectory) > 0:
-            return self._last_trajectory[-1]
+            system = self._last_trajectory[-1]
+            if self._final_velocities is not None:
+                system = replace(system, velocities=self._final_velocities)
+            return system
         return self._system
 
     def set_system(self, system: AtomicSystem) -> None:
