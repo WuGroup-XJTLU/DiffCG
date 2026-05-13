@@ -871,6 +871,82 @@ def _save_checkpoint(step, params, opt_state, traj_state, loss_history, output_d
     logger.debug(f"Saved checkpoint to {ckpt_path}")
 
 
+def _load_checkpoint(resume_from, output_dir, optimizer, params):
+    """Load checkpoint from iteration_{resume_from}/ and return all state.
+
+    Reads checkpoint.npz (opt_state, ref_energies), params.npz, and the
+    trajectory file (found via glob — exactly one *.traj.npz per folder).
+    The optax optimizer tree structure is re-derived from a fresh init
+    so no tree metadata needs to be serialized.
+
+    Returns:
+        (params, opt_state, traj_state, loss_history)
+    """
+    import glob
+    import numpy as np
+
+    ckpt_dir = os.path.join(output_dir, f"iteration_{resume_from}")
+    ckpt_path = os.path.join(ckpt_dir, "checkpoint.npz")
+
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(
+            f"Checkpoint not found at {ckpt_path}. "
+            f"Iteration {resume_from} was likely created by an older version "
+            f"of diffcg that does not support checkpointing. "
+            f"Run without resume_from to start fresh."
+        )
+
+    ckpt = np.load(ckpt_path, allow_pickle=False)
+
+    # Load params
+    params_path = os.path.join(ckpt_dir, "params.npz")
+    if not os.path.exists(params_path):
+        raise FileNotFoundError(f"params.npz not found in {ckpt_dir}")
+    params_np = np.load(params_path, allow_pickle=True)
+    loaded_params = {"pair": jnp.asarray(params_np["pair"])}
+
+    # Load trajectory (find the .traj.npz file — exactly one per folder)
+    traj_files = glob.glob(os.path.join(ckpt_dir, "*.traj.npz"))
+    if not traj_files:
+        raise FileNotFoundError(f"No .traj.npz file found in {ckpt_dir}")
+    if len(traj_files) > 1:
+        logger.warning(
+            f"Multiple .traj.npz files found in {ckpt_dir}, using {traj_files[0]}"
+        )
+    traj = Trajectory.load(traj_files[0])
+
+    # Load ref_energies
+    ref_energies = jnp.asarray(ckpt["ref_energies"])
+    traj_state = {"trajs": traj, "ref_energies": ref_energies}
+
+    # Load opt_state — re-derive tree structure from optimizer
+    n_leaves = int(ckpt["n_opt_leaves"])
+    opt_leaves = [jnp.asarray(ckpt[f"opt_state_{i}"]) for i in range(n_leaves)]
+    _, tree_opt = jax.tree_util.tree_flatten(optimizer.init(loaded_params))
+    opt_state = jax.tree_util.tree_unflatten(tree_opt, opt_leaves)
+
+    # Load loss history
+    loss_history = []
+    if "loss_history" in ckpt:
+        loss_history = [float(x) for x in ckpt["loss_history"]]
+    else:
+        # Fallback: try CSV
+        csv_path = os.path.join(ckpt_dir, "loss_history.csv")
+        if os.path.exists(csv_path):
+            with open(csv_path) as f:
+                for line in f:
+                    parts = line.strip().split(",")
+                    if len(parts) == 2:
+                        loss_history.append(float(parts[1]))
+
+    logger.info(
+        f"Loaded checkpoint from iteration {resume_from}: "
+        f"{len(loss_history)} loss values, "
+        f"{len(traj)} trajectory frames"
+    )
+    return loaded_params, opt_state, traj_state, loss_history
+
+
 def optimize_diffsim(generate_trajectory_fn, update_fn, params, total_iterations, *,
                      quantity_dict=None, output_dir="output", save_figures=False,
                      optimizer=None, compute_observables_fn=None, loss_fn=None):
