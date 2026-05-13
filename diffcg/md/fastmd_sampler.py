@@ -71,6 +71,39 @@ def _write_fastmd_table(filepath: str, x_vals, y_vals, keyword: str):
         f.write("\n")
 
 
+def _parse_restart_velocities(filepath: str) -> Optional[np.ndarray]:
+    """Parse Velocities section from a fastMD restart LAMMPS data file.
+
+    Args:
+        filepath: Path to restart_final.data
+
+    Returns:
+        (N,3) float32 array in nm/ps, or None if no Velocities section found.
+    """
+    with open(filepath, "r") as f:
+        lines = f.readlines()
+
+    in_velocities = False
+    velocities = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped == "Velocities":
+            in_velocities = True
+            continue
+        if in_velocities:
+            if stripped[0].isupper():  # next section header (Bonds, Angles, etc.)
+                break
+            parts = stripped.split()
+            if len(parts) >= 4:
+                velocities.append([float(parts[1]), float(parts[2]), float(parts[3])])
+
+    if not velocities:
+        return None
+    return np.array(velocities, dtype=np.float32)
+
+
 class FastMDSampler:
     """Molecular dynamics sampler that runs fastMD via subprocess.
 
@@ -364,6 +397,15 @@ class FastMDSampler:
             masses=self._system.masses,
             pbc=self._system.pbc,
         )
+
+        restart_final = os.path.join(self._work_dir, "restart_final.data")
+        if os.path.exists(restart_final):
+            self._final_velocities = jnp.array(
+                _parse_restart_velocities(restart_final), dtype=jnp.float32
+            )
+            logger.debug("Parsed velocities from %s", restart_final)
+        else:
+            self._final_velocities = None
 
         if self.trajectory_path is not None:
             self._last_trajectory.save(self.trajectory_path)
