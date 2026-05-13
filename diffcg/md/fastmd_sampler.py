@@ -323,6 +323,14 @@ class FastMDSampler:
                     f"{R[i, 0]:.6f} {R[i, 1]:.6f} {R[i, 2]:.6f}\n"
                 )
 
+            if self._system.velocities is not None:
+                vel = np.asarray(self._system.velocities)
+                f.write("\nVelocities\n\n")
+                for i in range(n_atoms):
+                    f.write(
+                        f"{i + 1} {vel[i, 0]:.6f} {vel[i, 1]:.6f} {vel[i, 2]:.6f}\n"
+                    )
+
     def _write_table_files(self, iter_dir: str) -> None:
         """Write pair_table.txt in nm/kJ/mol.
 
