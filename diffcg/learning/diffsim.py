@@ -949,14 +949,70 @@ def _load_checkpoint(resume_from, output_dir, optimizer, params):
 
 def optimize_diffsim(generate_trajectory_fn, update_fn, params, total_iterations, *,
                      quantity_dict=None, output_dir="output", save_figures=False,
-                     optimizer=None, compute_observables_fn=None, loss_fn=None):
+                     optimizer=None, compute_observables_fn=None, loss_fn=None,
+                     resume_from=None):
     """
     Convenience optimizer loop for single-state DiffSim update function.
 
     Phase 1: Generate initial trajectory BEFORE the loop.
     Phase 2: Reweighting optimization loop — each step checks n_eff, possibly
     regenerates, then takes a gradient step.
+
+    Args:
+        resume_from: If set to N, load checkpoint from iteration_{N}/ and resume
+                     from step N+1. Requires that iteration_{N}/ contains a
+                     checkpoint.npz file (produced by diffcg >= this version).
     """
+    if resume_from is not None:
+        # --- Resume from checkpoint ---
+        if optimizer is None:
+            raise ValueError("optimizer is required for resume")
+        params, opt_state, traj_state, loss_history = _load_checkpoint(
+            resume_from, output_dir, optimizer, params
+        )
+
+        times_per_update = []
+        predictions_history = []
+        params_set = []
+
+        logger.info(f"Resumed from iteration {resume_from}. "
+                     f"Running steps {resume_from + 1} to {total_iterations - 1}.")
+
+        for step in range(resume_from + 1, total_iterations):
+            start_time = time.time()
+            params_before = params
+            params, opt_state, traj_state, loss_val, predictions = update_fn(
+                params, opt_state, traj_state
+            )
+            step_time = time.time() - start_time
+            logger.info('Step {} in {:0.2f} sec. Loss = {}\n\n'.format(step, step_time, loss_val))
+            if jnp.isnan(loss_val):
+                logger.error(
+                    'Loss is NaN. This was likely caused by divergence of the '
+                    'optimization or a bad model setup causing a NaN trajectory.'
+                )
+            loss_history.append(loss_val)
+            times_per_update.append(step_time)
+            predictions_history.append(predictions)
+            params_set.append(params_before)
+
+            # Save parameters for post-run diagnostics
+            iter_dir = os.path.join(output_dir, f"iteration_{step}")
+            os.makedirs(iter_dir, exist_ok=True)
+            np.savez(os.path.join(iter_dir, "params.npz"),
+                     pair=np.asarray(params["pair"]))
+
+            # Save checkpoint (opt_state + ref_energies + loss_history)
+            _save_checkpoint(step, params, opt_state, traj_state, loss_history, output_dir)
+
+            # Save figures if enabled
+            if save_figures and quantity_dict is not None:
+                from diffcg._core.visualization import save_iteration_figures
+                save_iteration_figures(step, predictions, quantity_dict, loss_history, output_dir)
+
+        return loss_history, times_per_update, predictions_history, params_set
+
+    # --- Original path (no resume) ---
     # Phase 1: Generate initial trajectory before the optimization loop
     logger.debug("Phase 1: Generating initial trajectory")
     traj_state = generate_trajectory_fn(params)
@@ -1007,6 +1063,9 @@ def optimize_diffsim(generate_trajectory_fn, update_fn, params, total_iterations
         os.makedirs(iter_dir, exist_ok=True)
         np.savez(os.path.join(iter_dir, "params.npz"),
                  pair=np.asarray(params["pair"]))
+
+        # Save checkpoint (opt_state + ref_energies + loss_history)
+        _save_checkpoint(step + 1, params, opt_state, traj_state, loss_history, output_dir)
 
         # Save figures if enabled
         if save_figures and quantity_dict is not None:
