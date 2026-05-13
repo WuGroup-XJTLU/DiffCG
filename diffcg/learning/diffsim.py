@@ -843,6 +843,34 @@ def init_diffsim(
     return generate_trajectory_fn, update_fn, compute_observables_fn
 
 
+def _save_checkpoint(step, params, opt_state, traj_state, loss_history, output_dir):
+    """Save checkpoint data to iteration_{step}/checkpoint.npz.
+
+    Saves flattened optax optimizer state (momentum accumulators, schedule step
+    counter), reference energies for reweighting, and loss history. Params and
+    trajectory are NOT duplicated — they remain in their existing files
+    (params.npz and *.traj.npz).
+    """
+    import numpy as np
+
+    flat_opt, _tree_opt = jax.tree_util.tree_flatten(opt_state)
+    save_dict = {
+        'ref_energies': np.asarray(traj_state['ref_energies']),
+        'step': np.array(step),
+        'n_opt_leaves': np.array(len(flat_opt)),
+    }
+    for i, leaf in enumerate(flat_opt):
+        save_dict[f'opt_state_{i}'] = np.asarray(leaf)
+    if loss_history:
+        save_dict['loss_history'] = np.array(loss_history, dtype=np.float64)
+
+    iter_dir = os.path.join(output_dir, f"iteration_{step}")
+    os.makedirs(iter_dir, exist_ok=True)
+    ckpt_path = os.path.join(iter_dir, "checkpoint.npz")
+    np.savez(ckpt_path, **save_dict)
+    logger.debug(f"Saved checkpoint to {ckpt_path}")
+
+
 def optimize_diffsim(generate_trajectory_fn, update_fn, params, total_iterations, *,
                      quantity_dict=None, output_dir="output", save_figures=False,
                      optimizer=None, compute_observables_fn=None, loss_fn=None):
