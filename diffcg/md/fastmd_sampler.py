@@ -36,6 +36,7 @@ dt {dt:.6f}
 nsteps {nsteps}
 dump_freq {dump_freq}
 thermo 1 {thermo_freq} thermo_fastmd.dat
+restart 0 restart.data
 {ensemble_line}
 {table_lines}
 lammps_data_file system.data
@@ -144,6 +145,7 @@ class FastMDSampler:
             self._work_dir_obj = None
 
         self._last_trajectory: Optional[Trajectory] = None
+        self._final_velocities: Optional[jnp.ndarray] = None
 
         logger.debug(
             "FastMDSampler: ensemble=%s thermostat=%s T=%.1fK (kT=%.4f) "
