@@ -387,7 +387,7 @@ def create_equilibration_run(
             trajectory=None,
             logfile=None,
             loginterval=_loginterval,
-            fastmd_exe=fc.get("fastmd_exe", "fastmd"),
+            fastmd_exe=fc.get("fastmd_exe"),
             work_dir=fc.get("work_dir"),
             random_seed=sampler_params.get("seed", 0),
         )
@@ -519,7 +519,7 @@ def create_production_run(
             trajectory=trajectory,
             logfile=logfile,
             loginterval=_loginterval,
-            fastmd_exe=fc.get("fastmd_exe", "fastmd"),
+            fastmd_exe=fc.get("fastmd_exe"),
             work_dir=fc.get("work_dir"),
             random_seed=sampler_params.get("seed", 0),
         )
