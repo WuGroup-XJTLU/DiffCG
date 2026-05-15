@@ -1,6 +1,10 @@
 import jax
 import jax.numpy as jnp
-from diffcg.nep.descriptor import compute_radial_descriptor
+from diffcg.nep.descriptor import (
+    compute_radial_descriptor,
+    compute_angular_descriptor,
+    _legendre,
+)
 
 
 def test_radial_descriptor_two_atoms():
@@ -32,3 +36,30 @@ def test_radial_descriptor_beyond_cutoff():
         n_max=2, basis_size=4,
     )
     assert jnp.allclose(q_radial, 0.0, atol=1e-6)
+
+
+def test_angular_descriptor_two_neighbors():
+    """Two neighbors at symmetric positions should give non-zero angular descriptor."""
+    n_max = 1
+    num_L = 3
+    num_types = 1
+    c_angular = jnp.ones((num_types, n_max + 1, 3))  # basis_size=2
+    R_i = jnp.array([0.0, 0.0, 0.0])
+    R_nbr = jnp.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    types_nbr = jnp.array([0, 0])
+
+    q = compute_angular_descriptor(
+        R_i, R_nbr, types_nbr, 0,
+        c_angular, rc_angular=3.0,
+        n_max=1, basis_size=2, num_L=3, L_max=2,
+        has_q_222=0, has_q_1111=0, has_q_112=0, has_q_1122=0,
+    )
+    # angular dim = (n_max+1) * num_L = 2 * 3 = 6
+    assert q.shape == (6,)
+
+
+def test_legendre():
+    assert abs(float(_legendre(0, 0.5)) - 1.0) < 1e-6
+    assert abs(float(_legendre(1, 0.5)) - 0.5) < 1e-6
+    # P_2(0.5) = (3*0.25 - 1)/2 = -0.125
+    assert abs(float(_legendre(2, 0.5)) - (-0.125)) < 1e-6

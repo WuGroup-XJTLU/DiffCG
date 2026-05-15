@@ -72,6 +72,21 @@ def compute_radial_descriptor(
     return result
 
 
+def _legendre(l: int, x):
+    """Legendre polynomial P_l(x)."""
+    if l == 0:
+        return jnp.ones_like(x)
+    if l == 1:
+        return x
+    P_prev2 = jnp.ones_like(x)
+    P_prev = x
+    for n in range(2, l + 1):
+        P = ((2 * n - 1) * x * P_prev - (n - 1) * P_prev2) / n
+        P_prev2 = P_prev
+        P_prev = P
+    return P_prev
+
+
 def compute_angular_descriptor(
     R_i: jnp.ndarray,
     R_neighbors: jnp.ndarray,
@@ -90,12 +105,54 @@ def compute_angular_descriptor(
 ) -> jnp.ndarray:
     """Compute angular descriptor q^{nl}_i for a single atom.
 
+    For each pair of neighbors (j, k), compute Legendre-weighted contributions
+    matching GPUMD's NEP4 implementation.
+
     Returns: (n_max+1,) * num_L angular descriptors (flattened).
-    For now returns zeros — full implementation requires careful spherical
-    harmonic invariant construction matching GPUMD's CUDA kernel exactly.
     """
+    M = R_neighbors.shape[0]
     dim_angular = (n_max + 1) * num_L
-    return jnp.zeros(dim_angular)
+    q_angular = jnp.zeros(dim_angular)
+
+    rc = rc_angular
+
+    for j in range(M):
+        r_ij_vec = R_neighbors[j] - R_i
+        r_ij = jnp.linalg.norm(r_ij_vec)
+        if r_ij >= rc or r_ij < 1e-10:
+            continue
+
+        fc_ij = cosine_cutoff(r_ij, rc)
+        s_ij = 2.0 * r_ij / rc - 1.0
+        T_ij = chebyshev_polynomials(s_ij, n_max)  # (n_max+1,)
+
+        for k in range(M):
+            if k == j:
+                continue
+            r_ik_vec = R_neighbors[k] - R_i
+            r_ik = jnp.linalg.norm(r_ik_vec)
+            if r_ik >= rc or r_ik < 1e-10:
+                continue
+
+            fc_ik = cosine_cutoff(r_ik, rc)
+            s_ik = 2.0 * r_ik / rc - 1.0
+            T_ik = chebyshev_polynomials(s_ik, n_max)  # (n_max+1,)
+
+            cos_theta = jnp.dot(r_ij_vec, r_ik_vec) / (r_ij * r_ik)
+            cos_theta = jnp.clip(cos_theta, -1.0, 1.0)
+
+            fc = fc_ij * fc_ik
+
+            l_offset = 0
+            for l in range(num_L):
+                P_l = _legendre(l, cos_theta)
+                for n in range(n_max + 1):
+                    idx = l_offset + n
+                    contribution = fc * T_ij[n] * T_ik[n] * P_l
+                    q_angular = q_angular.at[idx].add(contribution)
+                l_offset += (n_max + 1)
+
+    return q_angular
 
 
 def compute_nep_descriptor(
