@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["scikit-build-core>=0.9"]
+build-backend = "scikit_build_core.build"
 
 [project]
 name = "diffcg"
@@ -28,7 +28,6 @@ dependencies = [
   "optax>=0.1.6",
   "jax>=0.4",
   "jax-md>=0.2.7",
-  "fastmd>=0.2.0",
 ]
 
 [project.urls]
@@ -50,13 +49,10 @@ dev = [
 ]
 docs = ["mkdocs-material", "mkdocstrings[python]"]
 
-[tool.setuptools]
-include-package-data = true
-
-[tool.setuptools.packages.find]
-include = ["diffcg*"]
-
- 
+[tool.scikit-build]
+cmake.args = ["-DCMAKE_BUILD_TYPE=Release"]
+wheel.packages = ["diffcg"]
+sdist.include = ["vendor/"]
 
 [tool.ruff]
 line-length = 100
@@ -69,5 +65,3 @@ target-version = ["py39"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
-
-

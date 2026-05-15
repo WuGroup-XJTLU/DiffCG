@@ -411,7 +411,7 @@ def create_equilibration_run(
             trajectory=None,
             logfile=None,
             loginterval=_loginterval,
-            gpumd_exe=gc.get("gpumd_exe", "gpumd"),
+            gpumd_exe=gc.get("gpumd_exe"),
             work_dir=gc.get("work_dir"),
             random_seed=sampler_params.get("seed", 0),
         )
@@ -543,7 +543,7 @@ def create_production_run(
             trajectory=trajectory,
             logfile=logfile,
             loginterval=_loginterval,
-            gpumd_exe=gc.get("gpumd_exe", "gpumd"),
+            gpumd_exe=gc.get("gpumd_exe"),
             work_dir=gc.get("work_dir"),
             random_seed=sampler_params.get("seed", 0),
             restart_system=restart_state.get("system") if restart_state else None,

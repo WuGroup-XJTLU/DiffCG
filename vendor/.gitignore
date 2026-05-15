@@ -1,0 +1,4 @@
+*.o
+gpumd
+nep
+fastmd

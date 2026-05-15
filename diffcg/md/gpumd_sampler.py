@@ -55,7 +55,7 @@ class GPUMDSampler:
         trajectory: Optional[str] = None,
         logfile: Optional[str] = None,
         loginterval: int = 100,
-        gpumd_exe: str = "gpumd",
+        gpumd_exe: Optional[str] = None,
         work_dir: Optional[str] = None,
         random_seed: int = 0,
         restart_system: Optional[AtomicSystem] = None,
@@ -76,6 +76,10 @@ class GPUMDSampler:
         self.trajectory_path = trajectory
         self.logfile = logfile
         self.loginterval = loginterval
+        if gpumd_exe is None:
+            from diffcg._binaries import get_gpumd_path
+
+            gpumd_exe = get_gpumd_path()
         self.gpumd_exe = gpumd_exe
         self.random_seed = random_seed if random_seed != 0 else 12345
         self._restart_system = restart_system
@@ -127,19 +131,24 @@ class GPUMDSampler:
 
         lines.append(f"time_step {self.timestep}")
         lines.append(f"dump_thermo {self.loginterval}")
-        lines.append(f"dump_xyz {self.loginterval} 0 {self._work_dir}/dump_xyz.xyz")
+        lines.append(f"dump_xyz -1 0 {self.loginterval} dump_xyz.xyz")
         lines.append(f"run {steps}")
 
         return "\n".join(lines) + "\n"
 
     def _write_input_files(self, steps: int) -> None:
         """Write xyz.in, nep.txt, and run.in to work directory."""
-        # xyz.in
+        # GPUMD reads the structure from model.xyz by default
         system = self._restart_system if self._restart_system is not None else self._system
-        write_xyz_in(system, os.path.join(self._work_dir, "xyz.in"))
+        write_xyz_in(system, os.path.join(self._work_dir, "model.xyz"))
 
-        # nep.txt
-        write_nep(os.path.join(self._work_dir, "nep.txt"), self.nep_params)
+        # nep.txt — convert cutoffs from nm (diffcg internal) to Angstroms (GPUMD)
+        import copy
+        nep_params_ang = copy.deepcopy(self.nep_params)
+        nm_to_a = NM_TO_ANGSTROM
+        nep_params_ang["rc_radial"] = [r * nm_to_a for r in nep_params_ang["rc_radial"]]
+        nep_params_ang["rc_angular"] = [r * nm_to_a for r in nep_params_ang["rc_angular"]]
+        write_nep(os.path.join(self._work_dir, "nep.txt"), nep_params_ang)
 
         # run.in
         run_in = self._generate_run_in(steps)

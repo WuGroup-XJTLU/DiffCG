@@ -163,9 +163,9 @@ class FastMDSampler:
         self.logfile = logfile
         self.loginterval = loginterval
         if fastmd_exe is None:
-            from fastmd import get_binary_path
+            from diffcg._binaries import get_fastmd_path
 
-            fastmd_exe = get_binary_path()
+            fastmd_exe = get_fastmd_path()
         self.fastmd_exe = fastmd_exe
         self.random_seed = random_seed if random_seed != 0 else 12345
         self.skin = skin                     # nm
