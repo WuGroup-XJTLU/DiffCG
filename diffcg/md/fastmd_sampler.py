@@ -44,7 +44,7 @@ lammps_data_file system.data
 """
 
 
-def _write_fastmd_table(filepath: str, x_vals, y_vals, keyword: str):
+def _write_fastmd_table(filepath: str, x_vals, y_vals, keyword: str, force_vals=None):
     """Write a single table section for fastMD (nm, kJ/mol — no unit conversion).
 
     fastMD expects the same text format as LAMMPS TABLE but uses nm/kJ/mol
@@ -56,12 +56,20 @@ def _write_fastmd_table(filepath: str, x_vals, y_vals, keyword: str):
         x_vals: Independent variable in nm.
         y_vals: Energy in kJ/mol.
         keyword: Section keyword (e.g. "PAIR_0").
+        force_vals: Precomputed f_div_r values. If None, computed via np.gradient.
     """
     x = np.asarray(x_vals, dtype=float)
     y = np.asarray(y_vals, dtype=float)
     N = len(x)
-    dydx = np.gradient(y, x)
-    force = -dydx  # kJ/(mol·nm)
+    if force_vals is not None:
+        force = np.asarray(force_vals, dtype=float)
+    else:
+        dydx = np.gradient(y, x)
+        # fastMD table kernel computes fx = f_scalar * dx (no /r division),
+        # so it expects f_scalar = (-dE/dr) / r, not -dE/dr.
+        with np.errstate(divide='ignore', invalid='ignore'):
+            force = -dydx / np.where(x > 0, x, np.inf)
+        force = np.nan_to_num(force, nan=0.0, posinf=0.0, neginf=0.0)
 
     Path(filepath).parent.mkdir(parents=True, exist_ok=True)
     with open(filepath, "a") as f:
@@ -134,7 +142,7 @@ class FastMDSampler:
         trajectory: Optional[str] = None,
         logfile: Optional[str] = None,
         loginterval: int = 100,
-        fastmd_exe: str = "fastmd",
+        fastmd_exe: Optional[str] = None,
         work_dir: Optional[str] = None,
         random_seed: int = 0,
         skin: float = 0.3,
@@ -154,6 +162,10 @@ class FastMDSampler:
         self.trajectory_path = trajectory
         self.logfile = logfile
         self.loginterval = loginterval
+        if fastmd_exe is None:
+            from fastmd import get_binary_path
+
+            fastmd_exe = get_binary_path()
         self.fastmd_exe = fastmd_exe
         self.random_seed = random_seed if random_seed != 0 else 12345
         self.skin = skin                     # nm
@@ -344,7 +356,7 @@ class FastMDSampler:
             return
 
         # Collect all pair tables from energy objects
-        merged = {}  # keyword -> {"x": array, "y": array}
+        merged = {}  # keyword -> {"x": array, "y": array, "force": array or None}
         for obj in self.energy_objects:
             spec = obj.to_lammps()
             if spec.get("interaction_type") != "pair":
@@ -354,8 +366,15 @@ class FastMDSampler:
             for t in spec["tables"]:
                 kw = t["keyword"]
                 if kw not in merged:
-                    merged[kw] = {"x": t["x"], "y": np.zeros_like(t["y"])}
+                    merged[kw] = {"x": t["x"], "y": np.zeros_like(t["y"]), "force": None}
                 merged[kw]["y"] = merged[kw]["y"] + np.asarray(t["y"])
+                if "force_vals" in t:
+                    fv = np.asarray(t["force_vals"])
+                    if merged[kw]["force"] is None:
+                        merged[kw]["force"] = np.zeros_like(fv)
+                    merged[kw]["force"] = merged[kw]["force"] + fv
+                else:
+                    merged[kw]["force"] = None  # at least one contributor missing analytic forces
 
         if not merged:
             return
@@ -363,7 +382,7 @@ class FastMDSampler:
         filepath = os.path.join(iter_dir, "pair_table.txt")
         open(filepath, "w").close()  # clear
         for kw, m in merged.items():
-            _write_fastmd_table(filepath, m["x"], m["y"], kw)
+            _write_fastmd_table(filepath, m["x"], m["y"], kw, force_vals=m["force"])
 
     def run(self, steps: int) -> Trajectory:
         """Run fastMD for *steps* MD steps.
