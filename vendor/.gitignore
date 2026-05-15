@@ -1,4 +1,7 @@
 *.o
 gpumd
+!gpumd/
 nep
+!nep/
 fastmd
+!fastmd/
