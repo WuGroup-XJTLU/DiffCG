@@ -28,6 +28,7 @@ dependencies = [
   "optax>=0.1.6",
   "jax>=0.4",
   "jax-md>=0.2.7",
+  "fastmd>=0.2.0",
 ]
 
 [project.urls]
