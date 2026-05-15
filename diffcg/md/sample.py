@@ -20,6 +20,7 @@ from jax import random
 from diffcg.system import AtomicSystem, Trajectory, System
 from diffcg.md.jaxmd_sampler import JAXMDSampler, MDResult
 from diffcg.md.fastmd_sampler import FastMDSampler
+from diffcg.md.gpumd_sampler import GPUMDSampler
 from diffcg._core.logger import get_logger
 from diffcg._core.constants import BOLTZMANN_KJMOLK
 
@@ -391,6 +392,30 @@ def create_equilibration_run(
             random_seed=sampler_params.get("seed", 0),
         )
 
+    if sampler_backend == "gpumd":
+        gc = lammps_config or {}
+        return GPUMDSampler(
+            system,
+            energy_params=gc.get("energy_params"),
+            energy_objects=gc.get("energy_objects"),
+            topology=gc.get("topology", {}),
+            nep_params=gc["nep_params"],
+            ensemble=sampler_params["ensemble"],
+            thermostat=sampler_params["thermostat"],
+            temperature=sampler_params["temperature"],
+            timestep=sampler_params["timestep"],
+            friction=sampler_params.get("friction", 1.0),
+            cutoff=cutoff,
+            r_onset=gc.get("r_onset", cutoff * 0.8),
+            mol_ids=gc.get("mol_ids"),
+            trajectory=None,
+            logfile=None,
+            loginterval=_loginterval,
+            gpumd_exe=gc.get("gpumd_exe", "gpumd"),
+            work_dir=gc.get("work_dir"),
+            random_seed=sampler_params.get("seed", 0),
+        )
+
     return MolecularDynamics(
         system,
         energy_fn=energy_fn,
@@ -497,6 +522,31 @@ def create_production_run(
             fastmd_exe=fc.get("fastmd_exe", "fastmd"),
             work_dir=fc.get("work_dir"),
             random_seed=sampler_params.get("seed", 0),
+        )
+
+    if sampler_backend == "gpumd":
+        gc = lammps_config or {}
+        return GPUMDSampler(
+            system,
+            energy_params=gc.get("energy_params"),
+            energy_objects=gc.get("energy_objects"),
+            topology=gc.get("topology", {}),
+            nep_params=gc["nep_params"],
+            ensemble=sampler_params["ensemble"],
+            thermostat=sampler_params["thermostat"],
+            temperature=sampler_params["temperature"],
+            timestep=sampler_params["timestep"],
+            friction=sampler_params.get("friction", 1.0),
+            cutoff=cutoff,
+            r_onset=gc.get("r_onset", cutoff * 0.8),
+            mol_ids=gc.get("mol_ids"),
+            trajectory=trajectory,
+            logfile=logfile,
+            loginterval=_loginterval,
+            gpumd_exe=gc.get("gpumd_exe", "gpumd"),
+            work_dir=gc.get("work_dir"),
+            random_seed=sampler_params.get("seed", 0),
+            restart_system=restart_state.get("system") if restart_state else None,
         )
 
     md = MolecularDynamics(

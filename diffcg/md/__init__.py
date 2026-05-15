@@ -11,6 +11,7 @@ from .sample import (
 )
 from .jaxmd_sampler import JAXMDSampler, create_jaxmd_sampler
 from .lammps_sampler import LAMMPSSampler
+from .gpumd_sampler import GPUMDSampler
 
 __all__ = [
     "compute_energy",
@@ -24,4 +25,5 @@ __all__ = [
     "JAXMDSampler",
     "create_jaxmd_sampler",
     "LAMMPSSampler",
+    "GPUMDSampler",
 ]
