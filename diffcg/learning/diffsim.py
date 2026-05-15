@@ -251,6 +251,8 @@ def init_multistate_diffsim(
             restart_state = {'restart_file': md_equ.get_restart_file()}
         elif _backend == 'fastmd':
             restart_state = {}
+        elif _backend == 'gpumd':
+            restart_state = {'system': md_equ.get_final_system()}
         else:
             restart_state = {
                 'state': md_equ.get_final_state(),
@@ -683,6 +685,8 @@ def init_diffsim(
             restart_state = {'restart_file': md_equ.get_restart_file()}
         elif _sampler_backend == 'fastmd':
             restart_state = {}
+        elif _sampler_backend == 'gpumd':
+            restart_state = {'system': md_equ.get_final_system()}
         else:
             restart_state = {
                 'state': md_equ.get_final_state(),
