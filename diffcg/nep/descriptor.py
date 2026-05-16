@@ -80,14 +80,11 @@ def compute_radial_descriptor(
 
     result = jnp.zeros(n_max + 1)
     for tj in range(c_radial.shape[0]):
-        mask_tj = (types_neighbors == tj)
-        T_masked = jnp.where(mask_tj[:, None], T, 0.0)  # (M, basis_size+1)
-        fc_masked = jnp.where(mask_tj, fc, 0.0)  # (M,)
-        # c_radial[tj]: (n_max+1, basis_size+1)
-        # T_masked: (M, basis_size+1) -> broadcast to (n_max+1, M, basis_size+1)
-        weighted = fc_masked[None, :, None] * T_masked[None, :, :]  # (1, M, basis_size+1)
-        c_t = c_radial[tj]  # (n_max+1, basis_size+1)
-        result += jnp.sum(c_t[:, None, :] * weighted, axis=(1, 2))  # (n_max+1,)
+        mask = (types_neighbors == tj)
+        T_masked = jnp.where(mask[:, None], T, 0.0)  # (M, basis_size+1)
+        fc_masked = jnp.where(mask, fc, 0.0)          # (M,)
+        c_t = c_radial[tj]                             # (n_max+1, basis_size+1)
+        result += jnp.einsum('mk,nk,m->n', T_masked, c_t, fc_masked)
     return result
 
 
