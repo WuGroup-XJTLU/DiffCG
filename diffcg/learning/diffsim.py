@@ -643,7 +643,7 @@ def init_diffsim(
                 e_i = energy_fn(system_i, nbrs_i)
                 overflow_i = nbrs_i.did_buffer_overflow
                 return nbrs_i, (e_i, overflow_i)
-            final_nbrs, (energies, overflows) = jax.lax.scan(body_fn, nbrs, all_positions)
+            final_nbrs, (energies, overflows) = jax.lax.scan(body_fn, nbrs, all_positions, unroll=1)
             return energies, overflows, final_nbrs
 
         energies, overflows, final_nbrs = _scan_energies(all_R, _rerun_nbrs)
