@@ -622,11 +622,9 @@ def init_diffsim(
         nonlocal _rerun_nbrs, _rerun_sp
         energy_fn = build_energy_fn_with_params_fn(params, max_num_atoms=max_num_atoms)
         r_cut = state.get('r_cut', 1.0)
-        dtype = jnp.float64
-
-        all_R = traj.positions.astype(dtype)  # (B, N, 3)
+        all_R = traj.positions.astype(jnp.float32)  # (B, N, 3)
         z = traj.Z.astype(jnp.int16)  # (N,)
-        cell = traj.cell.astype(dtype) if traj.cell is not None else None  # (3,3)
+        cell = traj.cell.astype(jnp.float32) if traj.cell is not None else None  # (3,3)
 
         # Allocate neighbor list once (reuse across calls if possible)
         if _rerun_nbrs is None or _rerun_sp is None:
