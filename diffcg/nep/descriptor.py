@@ -453,22 +453,28 @@ def compute_nep_descriptor(
     R_extended = jnp.vstack([positions, ghost_pos])
     Z_extended = jnp.append(Z, jnp.int32(0))
 
-    # Prepare per-atom inputs for vmap
+    # Per-atom inputs: stack along leading axis for scan
     t_all = Z  # (N,)
     nbr_idx_all = nbrs.idx  # (N, max_nbrs)
     nbr_mask_all = nbr_idx_all < N  # (N, max_nbrs)
 
-    per_atom_fn = lambda R_i, t_i, nbr_idx, nbr_mask: _per_atom_descriptor(
-        R_i, t_i, nbr_idx, nbr_mask,
-        R_extended, Z_extended,
-        c_radial_params, c_angular_params,
-        rc_radial, rc_angular,
-        n_max_radial, n_max_angular,
-        basis_size_radial, basis_size_angular,
-        num_L, L_max,
-        has_q_222, has_q_1111, has_q_112, has_q_1122,
-        q_scaler, N,
-    )
+    def per_atom_scan_fn(carry, inputs):
+        R_i, t_i, nbr_idx, nbr_mask = inputs
+        desc_i = _per_atom_descriptor(
+            R_i, t_i, nbr_idx, nbr_mask,
+            R_extended, Z_extended,
+            c_radial_params, c_angular_params,
+            rc_radial, rc_angular,
+            n_max_radial, n_max_angular,
+            basis_size_radial, basis_size_angular,
+            num_L, L_max,
+            has_q_222, has_q_1111, has_q_112, has_q_1122,
+            q_scaler, N,
+        )
+        return carry, desc_i
 
-    descriptors = jax.vmap(per_atom_fn)(positions, t_all, nbr_idx_all, nbr_mask_all)
+    _, descriptors = jax.lax.scan(
+        per_atom_scan_fn, None,
+        (positions, t_all, nbr_idx_all, nbr_mask_all),
+    )
     return descriptors
