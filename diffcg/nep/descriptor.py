@@ -38,6 +38,7 @@ def chebyshev_polynomials(x: jnp.ndarray, n_max: int) -> jnp.ndarray:
         (..., n_max+1) where result[..., n] = T_n(x).
     """
     T_0 = jnp.ones_like(x)
+    x = jnp.clip(x, -1.0, 1.0)  # prevent overflow when fc=0 zeroes result anyway
     if n_max == 0:
         return T_0[..., None]
 
