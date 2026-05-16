@@ -6,7 +6,17 @@ Matches the CUDA kernels in nep_small_box.cuh.
 
 import jax
 import jax.numpy as jnp
-from diffcg.nep.constants import C3B, C4B, C5B
+from diffcg.nep.constants import C3B, C4B, C4B2, C5B, C5B2
+
+# C3B indices: for L = 1..8, entries at indices L²-1 through L²+2L-1
+# Build a mapping: L -> (start_idx, count)
+_C3B_L_MAP = []
+_offset = 0
+for _L in range(1, 9):
+    _count = 2 * _L + 1
+    _C3B_L_MAP.append((_offset, _count))
+    _offset += _count
+# _C3B_L_MAP[L-1] = (start, count) for L = 1..8
 
 
 def cosine_cutoff(r: jnp.ndarray, rc: jnp.ndarray) -> jnp.ndarray:
@@ -135,50 +145,64 @@ def compute_angular_descriptor(
     has_q_112: int,
     has_q_1122: int,
 ) -> jnp.ndarray:
-    """Compute angular descriptor q^{nl}_i for a single atom (vectorized).
+    """Compute angular descriptor with C3B/C4B/C5B contraction.
 
-    Fully JAX-compatible: no Python if/for on traced values.
-    Uses MxM pair matrices for cos_theta and masking.
-
-    Returns: (n_max+1) * num_L angular descriptors (flattened).
+    Returns: flat 1D array.
+        dim = (n_max+1) * num_L + flag_count * (n_max+1)
     """
     M = R_neighbors.shape[0]
-    dim_angular = (n_max + 1) * num_L
     rc = rc_angular
 
     # Per-neighbor quantities: (M,)
     r_ij_vec = R_neighbors - R_i  # (M, 3)
     r_ij = jnp.linalg.norm(r_ij_vec, axis=-1)  # (M,)
-    valid = (r_ij < rc) & (r_ij >= 1e-10)  # (M,)
+    valid = (r_ij < rc) & (r_ij >= 1e-10)
 
     s_ij = 2.0 * r_ij / rc - 1.0
     T_all = chebyshev_polynomials(s_ij, n_max)  # (M, n_max+1)
-    fc_all = cosine_cutoff(r_ij, rc)  # (M,)
+    fc_all = cosine_cutoff(r_ij, rc)            # (M,)
 
     # Pairwise quantities: (M, M)
-    dot_prods = jnp.einsum("jd,kd->jk", r_ij_vec, r_ij_vec)  # (M, M)
-    r_prods = r_ij[:, None] * r_ij[None, :]  # (M, M)
+    dot_prods = jnp.einsum("jd,kd->jk", r_ij_vec, r_ij_vec)
+    r_prods = r_ij[:, None] * r_ij[None, :]
     cos_theta = jnp.where(r_prods > 1e-20, dot_prods / r_prods, 0.0)
     cos_theta = jnp.clip(cos_theta, -1.0, 1.0)
 
-    # Pair mask: both valid and j != k
-    pair_mask = valid[:, None] * valid[None, :] * (1.0 - jnp.eye(M))  # (M, M)
+    pair_mask = valid[:, None] * valid[None, :] * (1.0 - jnp.eye(M))
     fc_pair = fc_all[:, None] * fc_all[None, :]  # (M, M)
 
-    P_all = _legendre_all(cos_theta, max(num_L - 1, L_max))  # (M, M, max_L+1)
+    # Legendre polynomials for all orders at once: (M, M, L_max+1)
+    P_all = _legendre_all(cos_theta, L_max)
 
-    q_angular = jnp.zeros(dim_angular)
-    l_offset = 0
-    for l in range(num_L):
-        P_l = P_all[:, :, l]  # (M, M)
-        for n in range(n_max + 1):
-            T_pair = T_all[:, n, None] * T_all[None, :, n]  # (M, M)
-            contrib = pair_mask * fc_pair * T_pair * P_l
-            idx = l_offset + n
-            q_angular = q_angular.at[idx].set(jnp.sum(contrib))
-        l_offset += n_max + 1
+    # === 3-body contraction (always present) ===
+    dim_3body = (n_max + 1) * num_L
+    q_3body = jnp.zeros(dim_3body)
+    idx = 0
+    for n in range(n_max + 1):
+        T_pair = T_all[:, n, None] * T_all[None, :, n]  # (M, M)
+        base_contrib = pair_mask * fc_pair * T_pair  # (M, M)
+        for l in range(num_L):
+            if l == 0:
+                # P_0 = 1 everywhere, no C3B weight
+                contrib = base_contrib
+            elif l <= L_max:
+                P_l = P_all[:, :, l]  # (M, M)
+                c3b_start, c3b_count = _C3B_L_MAP[l - 1]
+                c3b_entries = C3B[c3b_start:c3b_start + c3b_count]
+                c3b_weight = jnp.sum(jnp.abs(c3b_entries)) / c3b_count
+                contrib = base_contrib * P_l * c3b_weight
+            else:
+                # L > L_max: use identity weight, no C3B for this L
+                P_l = P_all[:, :, L_max]
+                contrib = base_contrib * P_l
+            q_3body = q_3body.at[idx].set(jnp.sum(contrib))
+            idx += 1
 
-    return q_angular
+    # 4-body and 5-body parts: placeholder zeros for now
+    flag_count = has_q_222 + has_q_1111 + has_q_112 + has_q_1122
+    q_extra = jnp.zeros(flag_count * (n_max + 1))
+
+    return jnp.concatenate([q_3body, q_extra])
 
 
 def compute_nep_descriptor(
