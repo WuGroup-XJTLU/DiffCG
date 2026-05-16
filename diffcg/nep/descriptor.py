@@ -16,15 +16,34 @@ def cosine_cutoff(r: jnp.ndarray, rc: jnp.ndarray) -> jnp.ndarray:
 
 
 def chebyshev_polynomials(x: jnp.ndarray, n_max: int) -> jnp.ndarray:
-    """Compute T_0(x) through T_{n_max}(x) using recurrence.
-    Args: x: (...) scaled to [-1, 1]. Returns: (..., n_max+1).
+    """Compute T_0(x) through T_{n_max}(x) via lax.scan recurrence.
+
+    Recurrence: T_n = 2*x*T_{n-1} - T_{n-2}, with T_0=1, T_1=x.
+
+    Args:
+        x: (...) scaled to [-1, 1].
+        n_max: max order (>= 0).
+
+    Returns:
+        (..., n_max+1) where result[..., n] = T_n(x).
     """
-    T = [jnp.ones_like(x)]
-    if n_max >= 1:
-        T.append(x)
-    for _ in range(2, n_max + 1):
-        T.append(2.0 * x * T[-1] - T[-2])
-    return jnp.stack(T, axis=-1)
+    T_0 = jnp.ones_like(x)
+    if n_max == 0:
+        return T_0[..., None]
+
+    T_1 = x
+    if n_max == 1:
+        return jnp.stack([T_0, T_1], axis=-1)
+
+    def step(carry, _):
+        T_prev, T_prev2 = carry
+        T_next = 2.0 * x * T_prev - T_prev2
+        return (T_next, T_prev), T_next
+
+    init = (T_1, T_0)
+    _, T_tail = jax.lax.scan(step, init, None, length=n_max - 1)
+    T_tail = jnp.moveaxis(T_tail, 0, -1)
+    return jnp.concatenate([T_0[..., None], T_1[..., None], T_tail], axis=-1)
 
 
 def compute_radial_descriptor(
