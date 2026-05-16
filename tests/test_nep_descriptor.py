@@ -145,3 +145,137 @@ def test_contract_4body_distinct_mask():
     assert q.shape == (n_max + 1,)
     # With M=2, can't form 3 distinct neighbors: mask_3 should zero everything
     assert jnp.allclose(q, 0.0)
+
+
+# --- JAX compatibility tests ---
+
+
+def test_radial_descriptor_jit_grad():
+    """radial descriptor compiles under jit and grad."""
+    c_radial = jnp.ones((1, 3, 5))
+    R_i = jnp.array([0.0, 0.0, 0.0])
+    R_nbr = jnp.array([[2.0, 0.0, 0.0]])
+    types_nbr = jnp.array([0])
+
+    fn = lambda ri: compute_radial_descriptor(
+        ri, R_nbr, types_nbr, 0, c_radial, rc_radial=5.0,
+        n_max=2, basis_size=4,
+    )
+
+    q_jit = jax.jit(fn)(R_i)
+    assert q_jit.shape == (3,)
+
+    grad_fn = jax.grad(lambda ri: jnp.sum(fn(ri)))
+    g = jax.jit(grad_fn)(R_i)
+    assert g.shape == (3,)
+
+
+def test_angular_descriptor_jit_grad():
+    """angular descriptor compiles under jit and grad."""
+    n_max = 1
+    num_L = 3
+    c_angular = jnp.ones((1, n_max + 1, 3))
+    R_i = jnp.array([0.0, 0.0, 0.0])
+    R_nbr = jnp.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    types_nbr = jnp.array([0, 0])
+
+    fn = lambda ri: compute_angular_descriptor(
+        ri, R_nbr, types_nbr, 0,
+        c_angular, rc_angular=3.0,
+        n_max=n_max, basis_size=2, num_L=num_L, L_max=2,
+        has_q_222=0, has_q_1111=0, has_q_112=0, has_q_1122=0,
+    )
+
+    q_jit = jax.jit(fn)(R_i)
+    assert q_jit.shape == ((n_max + 1) * num_L,)
+
+    grad_fn = jax.grad(lambda ri: jnp.sum(fn(ri)))
+    g = jax.jit(grad_fn)(R_i)
+    assert g.shape == (3,)
+
+
+def test_angular_descriptor_with_4body_flags():
+    """Shape includes 4-body terms when flags are set."""
+    n_max = 1
+    num_L = 3
+    c_angular = jnp.ones((1, n_max + 1, 3))
+    R_i = jnp.array([0.0, 0.0, 0.0])
+    R_nbr = jnp.array([
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ])
+    types_nbr = jnp.array([0, 0, 0])
+
+    # has_q_222=1 adds (n_max+1) = 2 entries
+    q = compute_angular_descriptor(
+        R_i, R_nbr, types_nbr, 0,
+        c_angular, rc_angular=3.0,
+        n_max=n_max, basis_size=2, num_L=num_L, L_max=2,
+        has_q_222=1, has_q_1111=0, has_q_112=0, has_q_1122=0,
+    )
+    expected_dim = (n_max + 1) * num_L + (n_max + 1)
+    assert q.shape == (expected_dim,)
+
+    # has_q_222=1, has_q_1111=1 adds 4 entries
+    q2 = compute_angular_descriptor(
+        R_i, R_nbr, types_nbr, 0,
+        c_angular, rc_angular=3.0,
+        n_max=n_max, basis_size=2, num_L=num_L, L_max=2,
+        has_q_222=1, has_q_1111=1, has_q_112=0, has_q_1122=0,
+    )
+    expected_dim2 = (n_max + 1) * num_L + 2 * (n_max + 1)
+    assert q2.shape == (expected_dim2,)
+
+
+def test_angular_descriptor_all_flags_jit():
+    """Full angular descriptor with all 4-body/5-body flags compiles under jit."""
+    n_max = 1
+    num_L = 3
+    c_angular = jnp.ones((1, n_max + 1, 3))
+    R_i = jnp.array([0.0, 0.0, 0.0])
+    R_nbr = jnp.array([
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ])
+    types_nbr = jnp.array([0, 0, 0])
+
+    fn = lambda ri: compute_angular_descriptor(
+        ri, R_nbr, types_nbr, 0,
+        c_angular, rc_angular=3.0,
+        n_max=n_max, basis_size=2, num_L=num_L, L_max=2,
+        has_q_222=1, has_q_1111=1, has_q_112=1, has_q_1122=1,
+    )
+
+    q = jax.jit(fn)(R_i)
+    # 3-body: 6 + 4*(2) = 14
+    assert q.shape == (14,)
+
+    grad_fn = jax.grad(lambda ri: jnp.sum(fn(ri)))
+    g = jax.jit(grad_fn)(R_i)
+    assert g.shape == (3,)
+
+
+def test_descriptor_shape_consistency():
+    """Descriptor output dimensions match computed dim."""
+    n_max_radial, n_max_angular = 2, 1
+    num_L = 3
+    flag_count = 1  # has_q_222
+    expected_dim = (n_max_radial + 1) + (n_max_angular + 1) * num_L + flag_count * (n_max_angular + 1)
+
+    c_angular = jnp.ones((1, n_max_angular + 1, 3))
+    R_i = jnp.array([0.0, 0.0, 0.0])
+    R_nbr = jnp.array([
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+    ])
+    types_nbr = jnp.array([0, 0])
+
+    q_angular = compute_angular_descriptor(
+        R_i, R_nbr, types_nbr, 0,
+        c_angular, rc_angular=3.0,
+        n_max=n_max_angular, basis_size=2, num_L=num_L, L_max=2,
+        has_q_222=1, has_q_1111=0, has_q_112=0, has_q_1122=0,
+    )
+    assert q_angular.shape[0] == (n_max_angular + 1) * num_L + flag_count * (n_max_angular + 1)
