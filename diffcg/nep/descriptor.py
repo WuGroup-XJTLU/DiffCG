@@ -191,6 +191,74 @@ def _contract_4body(
     return result
 
 
+def _contract_5body(
+    fc: jnp.ndarray,
+    T: jnp.ndarray,
+    pair_mask: jnp.ndarray,
+    cos_theta: jnp.ndarray,
+    coef: jnp.ndarray,
+    L_val: int,
+    n_max: int,
+) -> jnp.ndarray:
+    """5-body contraction over 4 distinct neighbors.
+
+    q_n = coef_scalar * sum_{j,k,l,m distinct}
+          fc_j*fc_k*fc_l*fc_m * T_nj*T_nk*T_nl*T_nm
+          * angular_factors(j,k,l,m)
+
+    Args:
+        fc: (M,) cutoff values.
+        T: (M, n_max+1) Chebyshev polynomials.
+        pair_mask: (M, M) mask, valid and j != k.
+        cos_theta: (M, M) pairwise cosine angles.
+        coef: C5B (3,) or C5B2 (10,) coefficients.
+        L_val: Legendre order (1 for C5B q112, 2 for C5B2 q1122).
+        n_max: radial expansion order.
+
+    Returns:
+        (n_max+1,) 5-body descriptor.
+    """
+    M = T.shape[0]
+    P_L = _legendre_all(cos_theta, L_val)[:, :, L_val]  # (M, M)
+
+    # 4-neighbor mask: all 4 indices distinct (6 pairwise checks)
+    mask_4 = (
+        pair_mask[:, :, None, None]
+        * pair_mask[:, None, :, None]
+        * pair_mask[:, None, None, :]
+        * pair_mask[None, :, :, None]
+        * pair_mask[None, :, None, :]
+        * pair_mask[None, None, :, :]
+    )  # (M, M, M, M)
+
+    coef_scalar = jnp.sum(coef)
+
+    G = fc[:, None] * T  # (M, n_max+1)
+
+    result = jnp.zeros(n_max + 1)
+    for n in range(n_max + 1):
+        G_n = G[:, n]  # (M,)
+        # 4-tuple product: (M, M, M, M)
+        G_jklm = (
+            G_n[:, None, None, None]
+            * G_n[None, :, None, None]
+            * G_n[None, None, :, None]
+            * G_n[None, None, None, :]
+        )
+        # Angular factors for all 6 pairs
+        angular = (
+            P_L[:, :, None, None]
+            * P_L[:, None, :, None]
+            * P_L[:, None, None, :]
+            * P_L[None, :, :, None]
+            * P_L[None, :, None, :]
+            * P_L[None, None, :, :]
+        )
+        contrib = mask_4 * G_jklm * angular
+        result = result.at[n].set(coef_scalar * jnp.sum(contrib))
+    return result
+
+
 def compute_angular_descriptor(
     R_i: jnp.ndarray,
     R_neighbors: jnp.ndarray,
@@ -271,12 +339,14 @@ def compute_angular_descriptor(
         q_4b2 = _contract_4body(fc_all, T_all, pair_mask, cos_theta, C4B2, L_val=1, n_max=n_max)
         parts.append(q_4b2)
 
-    # 5-body placeholders (zeros)
+    # 5-body terms
     if has_q_112:
-        parts.append(jnp.zeros(n_max + 1))
+        q_5b = _contract_5body(fc_all, T_all, pair_mask, cos_theta, C5B, L_val=1, n_max=n_max)
+        parts.append(q_5b)
 
     if has_q_1122:
-        parts.append(jnp.zeros(n_max + 1))
+        q_5b2 = _contract_5body(fc_all, T_all, pair_mask, cos_theta, C5B2, L_val=2, n_max=n_max)
+        parts.append(q_5b2)
 
     return jnp.concatenate(parts)
 
