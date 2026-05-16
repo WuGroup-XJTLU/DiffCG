@@ -538,6 +538,7 @@ def init_diffsim(
     Boltzmann_constant: float = BOLTZMANN_KJMOLK,
     regularizer_fn=None,
     start_step=0,
+    max_frames=2000,
 ):
     """
     Initialize a single-state DiffSim trajectory generator and update function (functional API).
@@ -558,6 +559,9 @@ def init_diffsim(
         Boltzmann_constant: float in kJ/(mol*K)
         start_step: Starting step number for iteration folder naming. Default 0.
             Set to N+1 when resuming from checkpoint at iteration N.
+        max_frames: Maximum trajectory frames to process in JAX scans.
+            If trajectory exceeds this, frames are uniformly subsampled.
+            Default 2000. Set to None to disable subsampling.
 
     Returns:
         (generate_trajectory_fn, update_fn, compute_observables_fn) where:
@@ -618,6 +622,13 @@ def init_diffsim(
     _rerun_nbrs = None
     _rerun_sp = None
 
+    def _subsample_all_R(all_R):
+        """Uniformly subsample frames if trajectory exceeds max_frames."""
+        if max_frames is None or all_R.shape[0] <= max_frames:
+            return all_R
+        indices = np.random.choice(all_R.shape[0], max_frames, replace=False)
+        return all_R[indices]
+
     def rerun_energy(params, traj: Trajectory):
         nonlocal _rerun_nbrs, _rerun_sp
         energy_fn = build_energy_fn_with_params_fn(params, max_num_atoms=max_num_atoms)
@@ -625,6 +636,8 @@ def init_diffsim(
         all_R = traj.positions.astype(jnp.float32)  # (B, N, 3)
         z = traj.Z.astype(jnp.int16)  # (N,)
         cell = traj.cell.astype(jnp.float32) if traj.cell is not None else None  # (3,3)
+
+        all_R = _subsample_all_R(all_R)
 
         # Allocate neighbor list once (reuse across calls if possible)
         if _rerun_nbrs is None or _rerun_sp is None:
@@ -732,6 +745,8 @@ def init_diffsim(
         z = traj.Z.astype(jnp.int16)
         cell = traj.cell.astype(jnp.float32) if traj.cell is not None else None
 
+        all_R = _subsample_all_R(all_R)
+
         if _rerun_nbrs is None or _rerun_sp is None:
             _rerun_nbrs, _rerun_sp = jaxmd_neighbor_list(
                 positions=all_R[0], cell=cell, cutoff=r_cut, capacity_multiplier=1.25,
@@ -780,7 +795,17 @@ def init_diffsim(
 
         # --- Step 2: Compute weighted loss + gradient ---
         kBT = sampler_params['temperature'] * Boltzmann_constant
-        all_R = trajs.positions.astype(jnp.float32)
+        # Apply frame subsampling (consistent indices for positions and energies)
+        all_R_full = trajs.positions.astype(jnp.float32)
+        if max_frames is not None and all_R_full.shape[0] > max_frames:
+            indices = np.random.choice(all_R_full.shape[0], max_frames, replace=False)
+            indices = np.sort(indices)  # sort for scan stability
+            all_R = all_R_full[indices]
+            ref_energies_sub = ref_energies[indices]
+        else:
+            all_R = all_R_full
+            ref_energies_sub = ref_energies
+
         z = trajs.Z.astype(jnp.int16)
         cell_arr = trajs.cell.astype(jnp.float32) if trajs.cell is not None else None
 
@@ -810,7 +835,7 @@ def init_diffsim(
             body_fn_remat = jax.checkpoint(body_fn)
             _, (energies_new, obs_per_frame) = jax.lax.scan(body_fn_remat, nbrs_for_grad, all_R)
 
-            log_weights = -(1.0 / kBT) * (energies_new - ref_energies)
+            log_weights = -(1.0 / kBT) * (energies_new - ref_energies_sub)
             log_weights = log_weights - jnp.max(log_weights)
             prob_ratios = jnp.exp(log_weights)
             weights = prob_ratios / jnp.sum(prob_ratios)
