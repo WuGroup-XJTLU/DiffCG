@@ -351,6 +351,49 @@ def compute_angular_descriptor(
     return jnp.concatenate(parts)
 
 
+def _per_atom_descriptor(
+    R_i: jnp.ndarray,
+    t_i: jnp.ndarray,
+    nbr_idx: jnp.ndarray,
+    nbr_mask: jnp.ndarray,
+    R_extended: jnp.ndarray,
+    Z_extended: jnp.ndarray,
+    c_radial_params: jnp.ndarray,
+    c_angular_params: jnp.ndarray,
+    rc_radial: jnp.ndarray,
+    rc_angular: jnp.ndarray,
+    n_max_radial: int,
+    n_max_angular: int,
+    basis_size_radial: int,
+    basis_size_angular: int,
+    num_L: int,
+    L_max: int,
+    has_q_222: int,
+    has_q_1111: int,
+    has_q_112: int,
+    has_q_1122: int,
+    q_scaler: jnp.ndarray,
+    N: int,
+) -> jnp.ndarray:
+    """Compute descriptor for a single atom. Compatible with vmap."""
+    nbr_idx = jnp.where(nbr_mask, nbr_idx, N)  # pad with ghost
+    R_nbr = R_extended[nbr_idx]
+    types_nbr = Z_extended[nbr_idx]
+
+    q_radial = compute_radial_descriptor(
+        R_i, R_nbr, types_nbr, t_i,
+        c_radial_params[t_i], rc_radial[t_i],
+        n_max_radial, basis_size_radial,
+    )
+    q_angular = compute_angular_descriptor(
+        R_i, R_nbr, types_nbr, t_i,
+        c_angular_params[t_i], rc_angular[t_i],
+        n_max_angular, basis_size_angular, num_L, L_max,
+        has_q_222, has_q_1111, has_q_112, has_q_1122,
+    )
+    return jnp.concatenate([q_radial, q_angular]) / q_scaler
+
+
 def compute_nep_descriptor(
     positions: jnp.ndarray,
     Z: jnp.ndarray,
@@ -371,16 +414,19 @@ def compute_nep_descriptor(
     has_q_1122: int,
     q_scaler: jnp.ndarray,
 ) -> jnp.ndarray:
-    """Compute full NEP descriptor for all atoms.
+    """Compute full NEP descriptor for all atoms via vmap.
 
-    Returns: (N, dim) normalized descriptor,
-        where dim = (n_max_radial+1) + (n_max_angular+1)*num_L.
+    Returns:
+        (N, dim) normalized descriptor,
+        dim = (n_max_radial+1) + (n_max_angular+1)*num_L
+              + (has_q_222+has_q_1111+has_q_112+has_q_1122)*(n_max_angular+1)
     """
     N = positions.shape[0]
     num_types = rc_radial.shape[0]
-    dim = (n_max_radial + 1) + (n_max_angular + 1) * num_L
+    flag_count = has_q_222 + has_q_1111 + has_q_112 + has_q_1122
+    dim = (n_max_radial + 1) + (n_max_angular + 1) * num_L + flag_count * (n_max_angular + 1)
 
-    # Reshape c_descriptor into per-type-pair arrays
+    # Reshape c_descriptor into per-type-pair arrays (static Python loop)
     radial_param_size = (n_max_radial + 1) * (basis_size_radial + 1)
     angular_param_size = (n_max_angular + 1) * (basis_size_angular + 1)
     block_size = radial_param_size + angular_param_size
@@ -392,41 +438,37 @@ def compute_nep_descriptor(
         for tj in range(num_types):
             offset = (ti * num_types + tj) * block_size
             c_radial_params = c_radial_params.at[ti, tj].set(
-                c_descriptor[offset:offset + radial_param_size].reshape(n_max_radial + 1, basis_size_radial + 1)
+                c_descriptor[offset:offset + radial_param_size].reshape(
+                    n_max_radial + 1, basis_size_radial + 1
+                )
             )
             c_angular_params = c_angular_params.at[ti, tj].set(
-                c_descriptor[offset + radial_param_size:offset + block_size].reshape(n_max_angular + 1, basis_size_angular + 1)
+                c_descriptor[offset + radial_param_size:offset + block_size].reshape(
+                    n_max_angular + 1, basis_size_angular + 1
+                )
             )
 
-    # Ghost atom at "infinite" distance so padded neighbors contribute zero
-    # via the cutoff function. Avoids boolean indexing on traced arrays.
+    # Ghost atom at "infinite" distance
     ghost_pos = jnp.array([1e10, 1e10, 1e10], dtype=positions.dtype)
     R_extended = jnp.vstack([positions, ghost_pos])
     Z_extended = jnp.append(Z, jnp.int32(0))
 
-    descriptors = jnp.zeros((N, dim))
-    for i in range(N):
-        t_i = Z[i]  # JAX scalar; avoid int() for trace compatibility
-        nbr_idx = nbrs.idx[i]
-        nbr_mask = nbr_idx < N
-        nbr_idx = jnp.where(nbr_mask, nbr_idx, N)  # pad with ghost atom index
+    # Prepare per-atom inputs for vmap
+    t_all = Z  # (N,)
+    nbr_idx_all = nbrs.idx  # (N, max_nbrs)
+    nbr_mask_all = nbr_idx_all < N  # (N, max_nbrs)
 
-        R_nbr = R_extended[nbr_idx]
-        types_nbr = Z_extended[nbr_idx]
+    per_atom_fn = lambda R_i, t_i, nbr_idx, nbr_mask: _per_atom_descriptor(
+        R_i, t_i, nbr_idx, nbr_mask,
+        R_extended, Z_extended,
+        c_radial_params, c_angular_params,
+        rc_radial, rc_angular,
+        n_max_radial, n_max_angular,
+        basis_size_radial, basis_size_angular,
+        num_L, L_max,
+        has_q_222, has_q_1111, has_q_112, has_q_1122,
+        q_scaler, N,
+    )
 
-        q_radial = compute_radial_descriptor(
-            positions[i], R_nbr, types_nbr, t_i,
-            c_radial_params[t_i], rc_radial[t_i],
-            n_max_radial, basis_size_radial,
-        )
-        q_angular = compute_angular_descriptor(
-            positions[i], R_nbr, types_nbr, t_i,
-            c_angular_params[t_i], rc_angular[t_i],
-            n_max_angular, basis_size_angular, num_L, L_max,
-            has_q_222, has_q_1111, has_q_112, has_q_1122,
-        )
-
-        q_i = jnp.concatenate([q_radial, q_angular])
-        descriptors = descriptors.at[i].set(q_i / q_scaler)
-
+    descriptors = jax.vmap(per_atom_fn)(positions, t_all, nbr_idx_all, nbr_mask_all)
     return descriptors
