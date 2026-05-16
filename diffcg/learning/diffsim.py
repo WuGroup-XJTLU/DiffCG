@@ -780,10 +780,9 @@ def init_diffsim(
 
         # --- Step 2: Compute weighted loss + gradient ---
         kBT = sampler_params['temperature'] * Boltzmann_constant
-        dtype = jnp.float64
-        all_R = trajs.positions.astype(dtype)
+        all_R = trajs.positions.astype(jnp.float32)
         z = trajs.Z.astype(jnp.int16)
-        cell_arr = trajs.cell.astype(dtype) if trajs.cell is not None else None
+        cell_arr = trajs.cell.astype(jnp.float32) if trajs.cell is not None else None
 
         r_cut = state.get('r_cut', 1.0)
         if _rerun_nbrs is None or _rerun_sp is None:
