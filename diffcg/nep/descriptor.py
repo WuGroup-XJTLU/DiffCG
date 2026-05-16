@@ -129,6 +129,68 @@ def _legendre_all(x: jnp.ndarray, L_max: int) -> jnp.ndarray:
     return jnp.concatenate([P_0[..., None], x[..., None], P_tail], axis=-1)
 
 
+def _contract_4body(
+    fc: jnp.ndarray,
+    T: jnp.ndarray,
+    pair_mask: jnp.ndarray,
+    cos_theta: jnp.ndarray,
+    coef: jnp.ndarray,
+    L_val: int,
+    n_max: int,
+) -> jnp.ndarray:
+    """4-body contraction over 3 distinct neighbors.
+
+    q_n = coef_scalar * sum_{j,k,l distinct} fc_j*fc_k*fc_l
+          * T_n(s_j)*T_n(s_k)*T_n(s_l)
+          * P_L(cos JK) * P_L(cos JL) * P_L(cos KL)
+
+    Args:
+        fc: (M,) cutoff values.
+        T: (M, n_max+1) Chebyshev polynomials.
+        pair_mask: (M, M) mask, valid and j != k.
+        cos_theta: (M, M) pairwise cosine angles.
+        coef: (5,) C4B or C4B2 coefficients.
+        L_val: Legendre order (2 for C4B q222, 1 for C4B2 q1111).
+        n_max: radial expansion order.
+
+    Returns:
+        (n_max+1,) 4-body descriptor.
+    """
+    M = T.shape[0]
+    P_L = _legendre_all(cos_theta, L_val)[:, :, L_val]  # (M, M)
+
+    # 3-neighbor mask: all pairs distinct
+    mask_3 = (
+        pair_mask[:, :, None]
+        * pair_mask[:, None, :]
+        * pair_mask[None, :, :]
+    )  # (M, M, M)
+
+    coef_scalar = jnp.sum(coef)
+
+    # Precompute fc * T for all n: (M, n_max+1)
+    G = fc[:, None] * T  # (M, n_max+1)
+
+    result = jnp.zeros(n_max + 1)
+    for n in range(n_max + 1):
+        G_n = G[:, n]  # (M,)
+        # (M,M,M) triple product
+        G_jkl = (
+            G_n[:, None, None]
+            * G_n[None, :, None]
+            * G_n[None, None, :]
+        )
+        contrib = (
+            mask_3
+            * G_jkl
+            * P_L[:, :, None]
+            * P_L[:, None, :]
+            * P_L[None, :, :]
+        )
+        result = result.at[n].set(coef_scalar * jnp.sum(contrib))
+    return result
+
+
 def compute_angular_descriptor(
     R_i: jnp.ndarray,
     R_neighbors: jnp.ndarray,
@@ -198,11 +260,25 @@ def compute_angular_descriptor(
             q_3body = q_3body.at[idx].set(jnp.sum(contrib))
             idx += 1
 
-    # 4-body and 5-body parts: placeholder zeros for now
-    flag_count = has_q_222 + has_q_1111 + has_q_112 + has_q_1122
-    q_extra = jnp.zeros(flag_count * (n_max + 1))
+    # === 4-body and 5-body terms ===
+    parts = [q_3body]
 
-    return jnp.concatenate([q_3body, q_extra])
+    if has_q_222:
+        q_4b = _contract_4body(fc_all, T_all, pair_mask, cos_theta, C4B, L_val=2, n_max=n_max)
+        parts.append(q_4b)
+
+    if has_q_1111:
+        q_4b2 = _contract_4body(fc_all, T_all, pair_mask, cos_theta, C4B2, L_val=1, n_max=n_max)
+        parts.append(q_4b2)
+
+    # 5-body placeholders (zeros)
+    if has_q_112:
+        parts.append(jnp.zeros(n_max + 1))
+
+    if has_q_1122:
+        parts.append(jnp.zeros(n_max + 1))
+
+    return jnp.concatenate(parts)
 
 
 def compute_nep_descriptor(

@@ -105,3 +105,43 @@ def test_legendre_all_multidimensional():
     assert P.shape == (2, 2, 3)
     assert jnp.allclose(P[0, 0, 0], 1.0)  # P_0 everywhere = 1
     assert jnp.allclose(P[:, :, 1], x)     # P_1 = x
+
+
+# --- 4-body contraction tests ---
+
+from diffcg.nep.descriptor import _contract_4body
+from diffcg.nep.constants import C4B, C4B2
+
+
+def test_contract_4body_basic():
+    """4-body contraction with simple 3-neighbor geometry."""
+    n_max = 2
+    M = 3
+    fc = jnp.array([0.5, 0.5, 0.5])
+    T = jnp.ones((M, n_max + 1))  # all T_n = 1 for simplicity
+    pair_mask = 1.0 - jnp.eye(M)  # all pairs valid
+    cos_theta = jnp.array([
+        [0.0, 0.5, 0.5],
+        [0.5, 0.0, 0.5],
+        [0.5, 0.5, 0.0],
+    ])
+
+    q = _contract_4body(fc, T, pair_mask, cos_theta, C4B, L_val=2, n_max=n_max)
+    assert q.shape == (n_max + 1,)
+    # With all-positive contributions, result should be non-zero
+    assert jnp.all(q != 0.0)
+
+
+def test_contract_4body_distinct_mask():
+    """4-body with only 2 neighbors should be zero (need 3 distinct)."""
+    n_max = 1
+    M = 2
+    fc = jnp.array([1.0, 1.0])
+    T = jnp.ones((M, n_max + 1))
+    pair_mask = 1.0 - jnp.eye(M)
+    cos_theta = jnp.array([[0.0, 0.5], [0.5, 0.0]])
+
+    q = _contract_4body(fc, T, pair_mask, cos_theta, C4B, L_val=2, n_max=n_max)
+    assert q.shape == (n_max + 1,)
+    # With M=2, can't form 3 distinct neighbors: mask_3 should zero everything
+    assert jnp.allclose(q, 0.0)
