@@ -56,6 +56,20 @@ def _smooth_cutoff_factor(dr, r_onset, r_cutoff):
   return jnp.where(dr < r_onset, 1, inner)
 
 
+def _smooth_cutoff_derivative(r, r_onset, r_cutoff):
+    """Derivative of _smooth_cutoff_factor with respect to r (numpy)."""
+    r = np.asarray(r, dtype=float)
+    rc2 = r_cutoff ** 2
+    ro2 = r_onset ** 2
+    r2 = r ** 2
+    result = np.zeros_like(r)
+    mask = (r >= r_onset) & (r <= r_cutoff)
+    r_m = r[mask]
+    r2_m = r_m ** 2
+    result[mask] = 12 * r_m * (rc2 - r2_m) * (ro2 - r2_m) / (rc2 - ro2) ** 3
+    return result
+
+
 def multiplicative_isotropic_cutoff(fn: Callable[..., jnp.ndarray],
                                     r_onset: float,
                                     r_cutoff: float) -> Callable[..., jnp.ndarray]:
@@ -607,9 +621,11 @@ class GenericRepulsionEnergy:
             self.epsilon = epsilon
             self.exp = exp
 
-    def to_lammps(self, n_points=500, r_min=0.05):
+    def to_lammps(self, n_points=5000, r_min=0.05):
         """No native LAMMPS style for generic repulsion — always tabulated."""
         x = np.linspace(r_min, float(self.r_cutoff), n_points)
+        S = np.asarray(_smooth_cutoff_factor(x, self.r_onset, self.r_cutoff))
+        dS = _smooth_cutoff_derivative(x, self.r_onset, self.r_cutoff)
         tables = []
         if self.atom_types is not None:
             ptm = np.asarray(self.pair_type_map)
@@ -624,17 +640,27 @@ class GenericRepulsionEnergy:
                     sig = float(self.sigma[pt])
                     eps = float(self.epsilon[pt])
                     exp_v = float(self.exp[pt])
-                    y = np.asarray(
-                        _smooth_cutoff_factor(x, self.r_onset, self.r_cutoff)
-                        * generic_repulsion(x, sigma=sig, epsilon=eps, exp=exp_v)
-                    )
-                    tables.append({"keyword": f"PAIR_{pt}", "x": x, "y": y, "types": (i, j)})
+                    U = generic_repulsion(x, sigma=sig, epsilon=eps, exp=exp_v)
+                    U = np.asarray(U)
+                    dU = -exp_v * U / np.where(x > 0, x, np.inf)
+                    dE_dr = dS * U + S * dU
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        force_vals = -dE_dr / np.where(x > 0, x, np.inf)
+                    force_vals = np.nan_to_num(force_vals, nan=0.0, posinf=0.0, neginf=0.0)
+                    y = S * U
+                    tables.append({"keyword": f"PAIR_{pt}", "x": x, "y": y,
+                                   "force_vals": force_vals, "types": (i, j)})
         else:
-            y = np.asarray(
-                _smooth_cutoff_factor(x, self.r_onset, self.r_cutoff)
-                * generic_repulsion(x, sigma=self.sigma, epsilon=self.epsilon, exp=self.exp)
-            )
-            tables.append({"keyword": "PAIR_0", "x": x, "y": y, "types": None})
+            U = generic_repulsion(x, sigma=self.sigma, epsilon=self.epsilon, exp=self.exp)
+            U = np.asarray(U)
+            dU = -self.exp * U / np.where(x > 0, x, np.inf)
+            dE_dr = dS * U + S * dU
+            with np.errstate(divide='ignore', invalid='ignore'):
+                force_vals = -dE_dr / np.where(x > 0, x, np.inf)
+            force_vals = np.nan_to_num(force_vals, nan=0.0, posinf=0.0, neginf=0.0)
+            y = S * U
+            tables.append({"keyword": "PAIR_0", "x": x, "y": y,
+                           "force_vals": force_vals, "types": None})
         return {
             "interaction_type": "pair",
             "lammps_style": "table",
@@ -966,9 +992,11 @@ class TabulatedPairEnergy:
         self.pair_type_map = None if pair_type_map is None else jnp.asarray(pair_type_map, dtype=jnp.int32)
         self.n_pair_types = self.y_vals.shape[0]
 
-    def to_lammps(self, n_points=500, r_min=0.05):
+    def to_lammps(self, n_points=5000, r_min=0.05):
         x = np.linspace(r_min, float(self.r_cutoff), n_points)
         cutoff_ang = float(self.r_cutoff) * NM_TO_ANGSTROM
+        S = np.asarray(_smooth_cutoff_factor(x, self.r_onset, self.r_cutoff))
+        dS = _smooth_cutoff_derivative(x, self.r_onset, self.r_cutoff)
         tables = []
         if self.atom_types is not None:
             ptm = np.asarray(self.pair_type_map)
@@ -981,16 +1009,26 @@ class TabulatedPairEnergy:
                         continue
                     seen.add(pt)
                     sp = custom_interpolate.MonotonicInterpolate(self.x_vals, self.y_vals[pt])
-                    y = np.asarray(
-                        _smooth_cutoff_factor(x, self.r_onset, self.r_cutoff) * sp(x)
-                    )
-                    tables.append({"keyword": f"PAIR_{pt}", "x": x, "y": y, "types": (i, j)})
+                    U = np.asarray(sp(x))
+                    dU = np.asarray(sp.derivative(x))
+                    dE_dr = dS * U + S * dU
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        force_vals = -dE_dr / np.where(x > 0, x, np.inf)
+                    force_vals = np.nan_to_num(force_vals, nan=0.0, posinf=0.0, neginf=0.0)
+                    y = S * U
+                    tables.append({"keyword": f"PAIR_{pt}", "x": x, "y": y,
+                                   "force_vals": force_vals, "types": (i, j)})
         else:
             sp = custom_interpolate.MonotonicInterpolate(self.x_vals, self.y_vals[0])
-            y = np.asarray(
-                _smooth_cutoff_factor(x, self.r_onset, self.r_cutoff) * sp(x)
-            )
-            tables.append({"keyword": "PAIR_0", "x": x, "y": y, "types": None})
+            U = np.asarray(sp(x))
+            dU = np.asarray(sp.derivative(x))
+            dE_dr = dS * U + S * dU
+            with np.errstate(divide='ignore', invalid='ignore'):
+                force_vals = -dE_dr / np.where(x > 0, x, np.inf)
+            force_vals = np.nan_to_num(force_vals, nan=0.0, posinf=0.0, neginf=0.0)
+            y = S * U
+            tables.append({"keyword": "PAIR_0", "x": x, "y": y,
+                           "force_vals": force_vals, "types": None})
         return {
             "interaction_type": "pair",
             "lammps_style": "table",

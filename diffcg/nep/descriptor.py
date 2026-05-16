@@ -103,54 +103,46 @@ def compute_angular_descriptor(
     has_q_112: int,
     has_q_1122: int,
 ) -> jnp.ndarray:
-    """Compute angular descriptor q^{nl}_i for a single atom.
+    """Compute angular descriptor q^{nl}_i for a single atom (vectorized).
 
-    For each pair of neighbors (j, k), compute Legendre-weighted contributions
-    matching GPUMD's NEP4 implementation.
+    Fully JAX-compatible: no Python if/for on traced values.
+    Uses MxM pair matrices for cos_theta and masking.
 
-    Returns: (n_max+1,) * num_L angular descriptors (flattened).
+    Returns: (n_max+1) * num_L angular descriptors (flattened).
     """
     M = R_neighbors.shape[0]
     dim_angular = (n_max + 1) * num_L
-    q_angular = jnp.zeros(dim_angular)
-
     rc = rc_angular
 
-    for j in range(M):
-        r_ij_vec = R_neighbors[j] - R_i
-        r_ij = jnp.linalg.norm(r_ij_vec)
-        if r_ij >= rc or r_ij < 1e-10:
-            continue
+    # Per-neighbor quantities: (M,)
+    r_ij_vec = R_neighbors - R_i  # (M, 3)
+    r_ij = jnp.linalg.norm(r_ij_vec, axis=-1)  # (M,)
+    valid = (r_ij < rc) & (r_ij >= 1e-10)  # (M,)
 
-        fc_ij = cosine_cutoff(r_ij, rc)
-        s_ij = 2.0 * r_ij / rc - 1.0
-        T_ij = chebyshev_polynomials(s_ij, n_max)  # (n_max+1,)
+    s_ij = 2.0 * r_ij / rc - 1.0
+    T_all = chebyshev_polynomials(s_ij, n_max)  # (M, n_max+1)
+    fc_all = cosine_cutoff(r_ij, rc)  # (M,)
 
-        for k in range(M):
-            if k == j:
-                continue
-            r_ik_vec = R_neighbors[k] - R_i
-            r_ik = jnp.linalg.norm(r_ik_vec)
-            if r_ik >= rc or r_ik < 1e-10:
-                continue
+    # Pairwise quantities: (M, M)
+    dot_prods = jnp.einsum("jd,kd->jk", r_ij_vec, r_ij_vec)  # (M, M)
+    r_prods = r_ij[:, None] * r_ij[None, :]  # (M, M)
+    cos_theta = jnp.where(r_prods > 1e-20, dot_prods / r_prods, 0.0)
+    cos_theta = jnp.clip(cos_theta, -1.0, 1.0)
 
-            fc_ik = cosine_cutoff(r_ik, rc)
-            s_ik = 2.0 * r_ik / rc - 1.0
-            T_ik = chebyshev_polynomials(s_ik, n_max)  # (n_max+1,)
+    # Pair mask: both valid and j != k
+    pair_mask = valid[:, None] * valid[None, :] * (1.0 - jnp.eye(M))  # (M, M)
+    fc_pair = fc_all[:, None] * fc_all[None, :]  # (M, M)
 
-            cos_theta = jnp.dot(r_ij_vec, r_ik_vec) / (r_ij * r_ik)
-            cos_theta = jnp.clip(cos_theta, -1.0, 1.0)
-
-            fc = fc_ij * fc_ik
-
-            l_offset = 0
-            for l in range(num_L):
-                P_l = _legendre(l, cos_theta)
-                for n in range(n_max + 1):
-                    idx = l_offset + n
-                    contribution = fc * T_ij[n] * T_ik[n] * P_l
-                    q_angular = q_angular.at[idx].add(contribution)
-                l_offset += (n_max + 1)
+    q_angular = jnp.zeros(dim_angular)
+    l_offset = 0
+    for l in range(num_L):
+        P_l = _legendre(l, cos_theta)  # (M, M)
+        for n in range(n_max + 1):
+            T_pair = T_all[:, n, None] * T_all[None, :, n]  # (M, M)
+            contrib = pair_mask * fc_pair * T_pair * P_l
+            idx = l_offset + n
+            q_angular = q_angular.at[idx].set(jnp.sum(contrib))
+        l_offset += n_max + 1
 
     return q_angular
 
@@ -202,26 +194,30 @@ def compute_nep_descriptor(
                 c_descriptor[offset + radial_param_size:offset + block_size].reshape(n_max_angular + 1, basis_size_angular + 1)
             )
 
+    # Ghost atom at "infinite" distance so padded neighbors contribute zero
+    # via the cutoff function. Avoids boolean indexing on traced arrays.
+    ghost_pos = jnp.array([1e10, 1e10, 1e10], dtype=positions.dtype)
+    R_extended = jnp.vstack([positions, ghost_pos])
+    Z_extended = jnp.append(Z, jnp.int32(0))
+
     descriptors = jnp.zeros((N, dim))
     for i in range(N):
-        t_i = int(Z[i])
+        t_i = Z[i]  # JAX scalar; avoid int() for trace compatibility
         nbr_idx = nbrs.idx[i]
         nbr_mask = nbr_idx < N
-        nbr_idx = nbr_idx[nbr_mask]
-        if len(nbr_idx) == 0:
-            continue
+        nbr_idx = jnp.where(nbr_mask, nbr_idx, N)  # pad with ghost atom index
 
-        R_nbr = positions[nbr_idx]
-        types_nbr = Z[nbr_idx]
+        R_nbr = R_extended[nbr_idx]
+        types_nbr = Z_extended[nbr_idx]
 
         q_radial = compute_radial_descriptor(
             positions[i], R_nbr, types_nbr, t_i,
-            c_radial_params[t_i], float(rc_radial[t_i]),
+            c_radial_params[t_i], rc_radial[t_i],
             n_max_radial, basis_size_radial,
         )
         q_angular = compute_angular_descriptor(
             positions[i], R_nbr, types_nbr, t_i,
-            c_angular_params[t_i], float(rc_angular[t_i]),
+            c_angular_params[t_i], rc_angular[t_i],
             n_max_angular, basis_size_angular, num_L, L_max,
             has_q_222, has_q_1111, has_q_112, has_q_1122,
         )

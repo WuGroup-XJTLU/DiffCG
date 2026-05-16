@@ -122,6 +122,27 @@ class MonotonicInterpolate:
 
         return y_new
 
+    def derivative(self, x_new):
+        """Evaluate analytic derivative dy/dx at new data points.
+
+        Uses the stored cubic coefficients (a, b, c) to compute
+        dy/dx = 3*a*dx² + 2*b*dx + c via Horner evaluation.
+        """
+        x_new = jnp.clip(x_new, self.x[0], self.x[-1])
+
+        a, b, c, _ = self.coefficients
+
+        x_new_idx = jnp.searchsorted(self.x, x_new, side="right") - 1
+        x_new_idx = jnp.where(x_new_idx < 0, 0, x_new_idx)
+        x_new_idx = jnp.where(x_new_idx > len(self.x) - 2, len(self.x) - 2, x_new_idx)
+
+        a = a[x_new_idx]
+        b = b[x_new_idx]
+        c = c[x_new_idx]
+
+        dx = x_new - self.x[x_new_idx]
+        return (3 * a * dx + 2 * b) * dx + c
+
     def tree_flatten(self):
         children = (self.x, self.y, self.coefficients)
         aux_data = None

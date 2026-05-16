@@ -22,19 +22,23 @@ def apply_nep_network_batch(
     ann_params: dict,
     b1: float,
 ) -> jnp.ndarray:
-    """Compute per-atom energies.
+    """Compute per-atom energies (JAX-traceable).
+
     descriptors: (N, dim), types: (N,), ann_params: per-type {w0, b0, w1}.
     Returns: (N,) per-atom energies in eV.
+
+    Uses mask-based accumulation instead of boolean indexing so the
+    function is compatible with JAX tracing (jax.jit, jax.grad).
     """
     N = descriptors.shape[0]
     energies = jnp.zeros(N)
     for t in ann_params:
-        mask = (types == t)
-        if not jnp.any(mask):
-            continue
         ap = ann_params[t]
-        q_masked = descriptors[mask]
-        hidden = jnp.tanh(q_masked @ ap["w0"].T + ap["b0"])
-        e_masked = hidden @ ap["w1"] + b1
-        energies = energies.at[mask].set(e_masked)
+        mask = (types == t)  # (N,) bool
+        mask_f = mask.astype(descriptors.dtype)  # (N,) float
+
+        # Apply network to all atoms, then mask by type
+        hidden = jnp.tanh(descriptors @ ap["w0"].T + ap["b0"])  # (N, neurons)
+        e_all = hidden @ ap["w1"] + b1  # (N,)
+        energies = energies + mask_f * e_all
     return energies
