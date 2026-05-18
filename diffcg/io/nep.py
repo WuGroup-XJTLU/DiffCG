@@ -193,9 +193,20 @@ def write_nep(filepath: str, nep_dict: dict) -> None:
     q_scaler = nep_dict["q_scaler"]
     dim = nep_dict["dim"]
 
+    model_type = nep_dict.get("model_type", f"nep{version}")
+
     with open(filepath, "w") as f:
         # Line 1
-        f.write(f"nep{version} {num_types} {' '.join(elements)}\n")
+        f.write(f"{model_type} {num_types} {' '.join(elements)}\n")
+
+        # Optional soft_repulsion
+        if model_type in ("nep_cg", "nep5_cg"):
+            sr = nep_dict["soft_repulsion"]
+            f.write(
+                f"soft_repulsion {sr['sigma']} {sr['epsilon']} {sr['exp']} "
+                f"{sr['r_onset']} {sr['r_cutoff']}\n"
+            )
+
         # Line 2: cutoff
         f.write(f"cutoff {rc_radial[0]} {rc_angular[0]} {MN_radial} {MN_angular}\n")
         # Line 3: n_max
