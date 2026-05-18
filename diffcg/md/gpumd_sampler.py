@@ -16,7 +16,7 @@ import numpy as np
 import jax.numpy as jnp
 
 from diffcg._core.logger import get_logger
-from diffcg._core.units import NM_TO_ANGSTROM, ANGSTROM_TO_NM
+from diffcg._core.units import NM_TO_ANGSTROM, ANGSTROM_TO_NM, KJMOL_TO_EV
 from diffcg.system import AtomicSystem, Trajectory
 from diffcg.io.gpumd_writer import write_xyz_in
 from diffcg.io.gpumd_reader import read_dump_xyz
@@ -148,6 +148,12 @@ class GPUMDSampler:
         nm_to_a = NM_TO_ANGSTROM
         nep_params_ang["rc_radial"] = [r * nm_to_a for r in nep_params_ang["rc_radial"]]
         nep_params_ang["rc_angular"] = [r * nm_to_a for r in nep_params_ang["rc_angular"]]
+        if "soft_repulsion" in nep_params_ang:
+            sr = nep_params_ang["soft_repulsion"]
+            sr["sigma"] *= nm_to_a
+            sr["r_onset"] *= nm_to_a
+            sr["r_cutoff"] *= nm_to_a
+            sr["epsilon"] *= KJMOL_TO_EV
         write_nep(os.path.join(self._work_dir, "nep.txt"), nep_params_ang)
 
         # run.in
