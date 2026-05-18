@@ -29,15 +29,38 @@ def read_nep(filepath: str) -> dict:
     # Line 1: nep<version> <num_types> <elem1> ...
     tokens = lines[0].split()
     version_str = tokens[0]
-    if version_str.startswith("nep"):
+    if version_str == "nep_cg":
+        version = 4
+        model_type = "nep_cg"
+    elif version_str == "nep5_cg":
+        version = 5
+        model_type = "nep5_cg"
+    elif version_str.startswith("nep"):
         version = int(version_str[3:])
+        model_type = version_str
     else:
         raise ValueError(f"Unknown NEP version: {version_str}")
     num_types = int(tokens[1])
     elements = tokens[2:2 + num_types]
 
-    # Line 2: cutoff <rc_radial> <rc_angular> <MN_radial> <MN_angular>
-    tokens = lines[1].split()
+    # Optional soft_repulsion line (for nep_cg / nep5_cg)
+    idx = 1
+    soft_repulsion = None
+    if model_type in ("nep_cg", "nep5_cg"):
+        tokens = lines[idx].split()
+        if tokens[0] != "soft_repulsion":
+            raise ValueError(f"Expected soft_repulsion line for {model_type}, got: {lines[idx]}")
+        soft_repulsion = {
+            "sigma": float(tokens[1]),
+            "epsilon": float(tokens[2]),
+            "exp": float(tokens[3]),
+            "r_onset": float(tokens[4]),
+            "r_cutoff": float(tokens[5]),
+        }
+        idx += 1
+
+    # Line idx: cutoff <rc_radial> <rc_angular> <MN_radial> <MN_angular>
+    tokens = lines[idx].split()
     n_extra = len(tokens) - 1
     if n_extra == 4:
         rc_radial = [float(tokens[1])] * num_types
@@ -50,30 +73,30 @@ def read_nep(filepath: str) -> dict:
         MN_radial = int(tokens[1 + num_types * 2])
         MN_angular = int(tokens[2 + num_types * 2])
 
-    # Line 3: n_max <n_max_radial> <n_max_angular>
-    tokens = lines[2].split()
+    # Line idx+1: n_max <n_max_radial> <n_max_angular>
+    tokens = lines[idx + 1].split()
     n_max_radial = int(tokens[1])
     n_max_angular = int(tokens[2])
 
-    # Line 4: basis_size <basis_size_radial> <basis_size_angular>
-    tokens = lines[3].split()
+    # Line idx+2: basis_size <basis_size_radial> <basis_size_angular>
+    tokens = lines[idx + 2].split()
     basis_size_radial = int(tokens[1])
     basis_size_angular = int(tokens[2])
 
-    # Line 5: l_max <L_max> <has_q_222> <has_q_1111> [has_q_112] [has_q_1122]
-    tokens = lines[4].split()
+    # Line idx+3: l_max <L_max> <has_q_222> <has_q_1111> [has_q_112] [has_q_1122]
+    tokens = lines[idx + 3].split()
     L_max = int(tokens[1])
     has_q_222 = int(tokens[2])
     has_q_1111 = int(tokens[3])
     has_q_112 = int(tokens[4]) if len(tokens) >= 5 else 0
     has_q_1122 = int(tokens[5]) if len(tokens) >= 6 else 0
 
-    # Line 6: ANN <num_neurons> 0
-    tokens = lines[5].split()
+    # Line idx+4: ANN <num_neurons> 0
+    tokens = lines[idx + 4].split()
     num_neurons = int(tokens[1])
 
     # Remaining lines are float values
-    float_lines_start = 6
+    float_lines_start = idx + 5
     params = []
     for line in lines[float_lines_start:]:
         params.append(float(line.split()[0]))
@@ -89,7 +112,7 @@ def read_nep(filepath: str) -> dict:
         num_L += 1
     if has_q_1122:
         num_L += 1
-    dim = (n_max_radial + 1) + (n_max_angular + 1) * num_L
+    dim = (n_max_radial + 1) + (n_max_angular + 1) * num_L + (has_q_222 + has_q_1111 + has_q_112 + has_q_1122) * (n_max_angular + 1)
 
     num_types_sq = num_types * num_types
     num_descriptor = num_types_sq * (
@@ -116,6 +139,7 @@ def read_nep(filepath: str) -> dict:
     b1 = ann_flat[offset]
 
     return {
+        "model_type": model_type,
         "version": version,
         "num_types": num_types,
         "elements": elements,
@@ -139,6 +163,7 @@ def read_nep(filepath: str) -> dict:
         "ann_params": ann_params,
         "b1": b1,
         "q_scaler": q_scaler,
+        "soft_repulsion": soft_repulsion,
     }
 
 
