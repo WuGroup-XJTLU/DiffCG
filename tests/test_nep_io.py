@@ -98,3 +98,64 @@ def test_parameter_count():
     assert len(result["descriptor_params"]) == expected_desc
     total = len(result["descriptor_params"]) + expected_ann + expected_q
     assert total > 0
+
+
+SAMPLE_NEP_CG = """nep_cg 1 H
+soft_repulsion 3.0 0.010364 8 13.0 15.0
+cutoff 8 4 73 8
+n_max 0 0
+basis_size 0 0
+l_max 1 0 0
+ANN 1 0
+ 1.0
+ 2.0
+ 3.0
+ 4.0
+ 5.0
+ 6.0
+ 7.0
+ 8.0
+ 9.0
+"""
+
+
+def test_read_nep_cg():
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+        f.write(SAMPLE_NEP_CG)
+        f.flush()
+        result = read_nep(f.name)
+    os.unlink(f.name)
+
+    assert result["model_type"] == "nep_cg"
+    assert result["version"] == 4
+    assert result["soft_repulsion"] is not None
+    assert result["soft_repulsion"]["sigma"] == 3.0
+    assert result["soft_repulsion"]["epsilon"] == 0.010364
+    assert result["soft_repulsion"]["exp"] == 8.0
+    assert result["soft_repulsion"]["r_onset"] == 13.0
+    assert result["soft_repulsion"]["r_cutoff"] == 15.0
+
+
+def test_read_write_roundtrip_nep_cg():
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+        f.write(SAMPLE_NEP_CG)
+        f.flush()
+        original = read_nep(f.name)
+    os.unlink(f.name)
+
+    outpath = tempfile.mktemp(suffix='.txt')
+    try:
+        write_nep(outpath, original)
+        reloaded = read_nep(outpath)
+    finally:
+        if os.path.exists(outpath):
+            os.unlink(outpath)
+
+    assert original["model_type"] == reloaded["model_type"] == "nep_cg"
+    assert original["soft_repulsion"] == reloaded["soft_repulsion"]
+    assert jnp.allclose(original["descriptor_params"], reloaded["descriptor_params"], atol=1e-6)
+    for t in range(original["num_types"]):
+        for k in ["w0", "b0", "w1"]:
+            assert jnp.allclose(original["ann_params"][t][k], reloaded["ann_params"][t][k], atol=1e-6)
+    assert jnp.isclose(original["b1"], reloaded["b1"], atol=1e-6)
+    assert jnp.allclose(original["q_scaler"], reloaded["q_scaler"], atol=1e-6)
