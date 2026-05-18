@@ -148,7 +148,7 @@ class GPUMDSampler:
         nm_to_a = NM_TO_ANGSTROM
         nep_params_ang["rc_radial"] = [r * nm_to_a for r in nep_params_ang["rc_radial"]]
         nep_params_ang["rc_angular"] = [r * nm_to_a for r in nep_params_ang["rc_angular"]]
-        if "soft_repulsion" in nep_params_ang:
+        if "soft_repulsion" in nep_params_ang and nep_params_ang["soft_repulsion"] is not None:
             sr = nep_params_ang["soft_repulsion"]
             sr["sigma"] *= nm_to_a
             sr["r_onset"] *= nm_to_a
