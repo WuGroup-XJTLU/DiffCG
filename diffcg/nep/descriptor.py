@@ -147,15 +147,18 @@ def _accumulate_s_one_jax(x, y, z, gn, L, Z_COEFF_L):
     M = x.shape[0]
     z_pow = jnp.stack([z ** p for p in range(L + 1)], axis=0)  # (L+1, M)
 
-    # Complex powers (x + i*y)^p for p=1..L
-    rp = [x]
-    ip = [y]
-    for p in range(1, L):
-        rp_prev, ip_prev = rp[-1], ip[-1]
-        rp.append(rp_prev * x - ip_prev * y)
-        ip.append(rp_prev * y + ip_prev * x)
-    rp = jnp.stack(rp, axis=0)  # (L, M)
-    ip = jnp.stack(ip, axis=0)  # (L, M)
+    # Complex powers (x + i*y)^p for p=1..L via scan recurrence
+    def _complex_power_step(carry, _):
+        rp_prev, ip_prev = carry
+        rp_next = rp_prev * x - ip_prev * y
+        ip_next = rp_prev * y + ip_prev * x
+        return (rp_next, ip_next), (rp_next, ip_next)
+
+    (_, _), (rp_stack, ip_stack) = jax.lax.scan(
+        _complex_power_step, (x, y), None, length=L - 1
+    )
+    rp = jnp.concatenate([x[None, :], rp_stack], axis=0)  # (L, M)
+    ip = jnp.concatenate([y[None, :], ip_stack], axis=0)  # (L, M)
 
     s = jnp.zeros(2 * L + 1)
     for n1 in range(L + 1):
