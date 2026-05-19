@@ -177,7 +177,7 @@ def init_multistate_diffsim(
                 results = []
                 for i in range(len(traj)):
                     sys_i = traj[i]
-                    sys_i_typed = AtomicSystem(R=sys_i.R.astype(dtype), Z=sys_i.Z.astype(jnp.int16), cell=sys_i.cell.astype(dtype) if sys_i.cell is not None else None)
+                    sys_i_typed = AtomicSystem(R=sys_i.R.astype(jnp.float32), Z=sys_i.Z.astype(jnp.int16), cell=sys_i.cell.astype(jnp.float32) if sys_i.cell is not None else None)
                     e_i = compute_energy(sys_i_typed, energy_fn, cutoff=r_cut)
                     results.append(e_i)
                 return jnp.stack(results)
@@ -666,7 +666,7 @@ def init_diffsim(
             results = []
             for i in range(len(traj)):
                 sys_i = traj[i]
-                sys_i_typed = AtomicSystem(R=sys_i.R.astype(dtype), Z=sys_i.Z.astype(jnp.int16), cell=sys_i.cell.astype(dtype) if sys_i.cell is not None else None)
+                sys_i_typed = AtomicSystem(R=sys_i.R.astype(jnp.float32), Z=sys_i.Z.astype(jnp.int16), cell=sys_i.cell.astype(jnp.float32) if sys_i.cell is not None else None)
                 e_i = compute_energy(sys_i_typed, energy_fn, cutoff=r_cut)
                 results.append(e_i)
             return jnp.stack(results)
@@ -927,7 +927,15 @@ def _load_checkpoint(resume_from, output_dir, optimizer, params):
     if not os.path.exists(params_path):
         raise FileNotFoundError(f"params.npz not found in {ckpt_dir}")
     params_np = np.load(params_path, allow_pickle=True)
-    loaded_params = {"pair": jnp.asarray(params_np["pair"])}
+    if "treedef" in params_np:
+        import pickle
+        params_treedef = pickle.loads(params_np["treedef"])
+        n_p_leaves = sum(1 for k in params_np.keys() if k.startswith("p_"))
+        params_leaves = [jnp.asarray(params_np[f"p_{i}"]) for i in range(n_p_leaves)]
+        loaded_params = jax.tree_util.tree_unflatten(params_treedef, params_leaves)
+    else:
+        # Backward compatibility: old format with single "pair" array
+        loaded_params = {"pair": jnp.asarray(params_np["pair"])}
 
     # Load trajectory (find the .traj.npz file — exactly one per folder)
     traj_files = glob.glob(os.path.join(ckpt_dir, "*.traj.npz"))
@@ -1023,8 +1031,11 @@ def optimize_diffsim(generate_trajectory_fn, update_fn, params, total_iterations
             # Save parameters for post-run diagnostics
             iter_dir = os.path.join(output_dir, f"iteration_{step}")
             os.makedirs(iter_dir, exist_ok=True)
-            np.savez(os.path.join(iter_dir, "params.npz"),
-                     pair=np.asarray(params["pair"]))
+            import pickle
+            flat_params, params_treedef = jax.tree_util.tree_flatten(params)
+            params_save_dict = {f"p_{i}": np.asarray(leaf) for i, leaf in enumerate(flat_params)}
+            params_save_dict["treedef"] = pickle.dumps(params_treedef)
+            np.savez(os.path.join(iter_dir, "params.npz"), **params_save_dict)
 
             # Save checkpoint (opt_state + ref_energies + loss_history)
             _save_checkpoint(step, params, opt_state, traj_state, loss_history, output_dir)
@@ -1085,8 +1096,11 @@ def optimize_diffsim(generate_trajectory_fn, update_fn, params, total_iterations
         # Save parameters for post-run diagnostics
         iter_dir = os.path.join(output_dir, f"iteration_{step+1}")
         os.makedirs(iter_dir, exist_ok=True)
-        np.savez(os.path.join(iter_dir, "params.npz"),
-                 pair=np.asarray(params["pair"]))
+        import pickle
+        flat_params, params_treedef = jax.tree_util.tree_flatten(params)
+        params_save_dict = {f"p_{i}": np.asarray(leaf) for i, leaf in enumerate(flat_params)}
+        params_save_dict["treedef"] = pickle.dumps(params_treedef)
+        np.savez(os.path.join(iter_dir, "params.npz"), **params_save_dict)
 
         # Save checkpoint (opt_state + ref_energies + loss_history)
         _save_checkpoint(step + 1, params, opt_state, traj_state, loss_history, output_dir)
