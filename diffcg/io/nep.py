@@ -122,9 +122,10 @@ def read_nep(filepath: str) -> dict:
     num_ann = (dim + 2) * num_neurons * num_types + 1
     num_q_scaler = dim
 
-    descriptor_params = params[:num_descriptor]
-    ann_flat = params[num_descriptor:num_descriptor + num_ann]
-    q_scaler = params[num_descriptor + num_ann:num_descriptor + num_ann + num_q_scaler]
+    # GPUMD parameter order: ANN params first, then descriptor params, then q_scaler
+    ann_flat = params[:num_ann]
+    descriptor_params = params[num_ann:num_ann + num_descriptor]
+    q_scaler = params[num_ann + num_descriptor:num_ann + num_descriptor + num_q_scaler]
 
     ann_params = {}
     offset = 0
@@ -195,6 +196,11 @@ def write_nep(filepath: str, nep_dict: dict) -> None:
 
     model_type = nep_dict.get("model_type", f"nep{version}")
 
+    from diffcg._core.units import NM_TO_ANGSTROM
+
+    rc_radial_ang = [c * NM_TO_ANGSTROM for c in rc_radial]
+    rc_angular_ang = [c * NM_TO_ANGSTROM for c in rc_angular]
+
     with open(filepath, "w") as f:
         # Line 1
         f.write(f"{model_type} {num_types} {' '.join(elements)}\n")
@@ -208,7 +214,7 @@ def write_nep(filepath: str, nep_dict: dict) -> None:
             )
 
         # Line 2: cutoff
-        f.write(f"cutoff {rc_radial[0]} {rc_angular[0]} {MN_radial} {MN_angular}\n")
+        f.write(f"cutoff {rc_radial_ang[0]} {rc_angular_ang[0]} {MN_radial} {MN_angular}\n")
         # Line 3: n_max
         f.write(f"n_max {n_max_radial} {n_max_angular}\n")
         # Line 4: basis_size
@@ -223,12 +229,7 @@ def write_nep(filepath: str, nep_dict: dict) -> None:
         # Line 6: ANN
         f.write(f"ANN {num_neurons} 0\n")
 
-        # Descriptor params
-        d = np.asarray(desc)
-        for v in d.ravel():
-            f.write(f" {v:.7e}\n")
-
-        # ANN params per type
+        # ANN params per type (must match GPUMD's update_potential order)
         for t in range(num_types):
             ap = ann_params[t]
             w0 = np.asarray(ap["w0"])
@@ -243,6 +244,11 @@ def write_nep(filepath: str, nep_dict: dict) -> None:
 
         # b1
         f.write(f" {float(b1):.7e}\n")
+
+        # Descriptor params
+        d = np.asarray(desc)
+        for v in d.ravel():
+            f.write(f" {v:.7e}\n")
 
         # q_scaler
         qs = np.asarray(q_scaler)

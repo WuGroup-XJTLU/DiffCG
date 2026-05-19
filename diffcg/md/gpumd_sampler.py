@@ -142,12 +142,11 @@ class GPUMDSampler:
         system = self._restart_system if self._restart_system is not None else self._system
         write_xyz_in(system, os.path.join(self._work_dir, "model.xyz"))
 
-        # nep.txt — convert cutoffs from nm (diffcg internal) to Angstroms (GPUMD)
+        # nep.txt — convert soft repulsion from nm (diffcg internal) to Angstroms (GPUMD)
+        # rc_radial/rc_angular are converted by write_nep, so only soft_repulsion here
         import copy
         nep_params_ang = copy.deepcopy(self.nep_params)
         nm_to_a = NM_TO_ANGSTROM
-        nep_params_ang["rc_radial"] = [r * nm_to_a for r in nep_params_ang["rc_radial"]]
-        nep_params_ang["rc_angular"] = [r * nm_to_a for r in nep_params_ang["rc_angular"]]
         if "soft_repulsion" in nep_params_ang and nep_params_ang["soft_repulsion"] is not None:
             sr = nep_params_ang["soft_repulsion"]
             sr["sigma"] *= nm_to_a

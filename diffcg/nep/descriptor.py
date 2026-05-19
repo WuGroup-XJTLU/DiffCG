@@ -85,9 +85,11 @@ def compute_radial_descriptor(
     Returns: (n_max+1,) radial descriptor
     """
     r_ij = jnp.linalg.norm(R_neighbors - R_i, axis=-1)  # (M,)
-    s_ij = 2.0 * r_ij / rc_radial - 1.0  # scale to [-1, 1]
+    y = r_ij / rc_radial
+    x = 2.0 * (y - 1.0) ** 2 - 1.0
+    T = chebyshev_polynomials(x, basis_size)
+    T = (T + 1.0) / 2.0
     fc = cosine_cutoff(r_ij, rc_radial)  # (M,)
-    T = chebyshev_polynomials(s_ij, basis_size)  # (M, basis_size+1)
 
     result = jnp.zeros(n_max + 1)
     for tj in range(c_radial.shape[0]):
@@ -130,9 +132,62 @@ def _legendre_all(x: jnp.ndarray, L_max: int) -> jnp.ndarray:
     return jnp.concatenate([P_0[..., None], x[..., None], P_tail], axis=-1)
 
 
+def _accumulate_s_one_jax(x, y, z, gn, L, Z_COEFF_L):
+    """JAX equivalent of GPUMD's accumulate_s_one.
+
+    Args:
+        x, y, z: (M,) normalized direction vectors.
+        gn: (M,) neighbor weights for a single n.
+        L: int, spherical harmonic order (1..8).
+        Z_COEFF_L: (L+1, L+1) Z-coefficient array.
+
+    Returns:
+        s: (2*L+1,) accumulated real spherical harmonic components.
+    """
+    M = x.shape[0]
+    z_pow = jnp.stack([z ** p for p in range(L + 1)], axis=0)  # (L+1, M)
+
+    # Complex powers (x + i*y)^p for p=1..L
+    rp = [x]
+    ip = [y]
+    for p in range(1, L):
+        rp_prev, ip_prev = rp[-1], ip[-1]
+        rp.append(rp_prev * x - ip_prev * y)
+        ip.append(rp_prev * y + ip_prev * x)
+    rp = jnp.stack(rp, axis=0)  # (L, M)
+    ip = jnp.stack(ip, axis=0)  # (L, M)
+
+    s = jnp.zeros(2 * L + 1)
+    for n1 in range(L + 1):
+        n2_start = (L + n1) % 2
+        n2 = jnp.arange(n2_start, L - n1 + 1, 2)
+        z_factor = jnp.sum(Z_COEFF_L[n1, n2][:, None] * z_pow[n2, :], axis=0)  # (M,)
+
+        if n1 == 0:
+            contrib = jnp.sum(z_factor * gn)
+            s = s.at[0].add(contrib)
+        else:
+            contrib_real = jnp.sum(z_factor * gn * rp[n1 - 1, :])
+            contrib_imag = jnp.sum(z_factor * gn * ip[n1 - 1, :])
+            s = s.at[2 * n1 - 1].add(contrib_real)
+            s = s.at[2 * n1].add(contrib_imag)
+    return s
+
+
+def _find_q_one_jax(s, L):
+    """JAX equivalent of GPUMD's find_q_one.
+
+    Computes: q = 2*sum_{k=1}^{2L} C3B[start+k]*s[start+k]^2 + C3B[start]*s[start]^2
+    """
+    start = L * L - 1
+    num_terms = 2 * L + 1
+    q_nonzero = jnp.sum(C3B[start + 1:start + num_terms] * s[start + 1:start + num_terms] ** 2)
+    q_zero = C3B[start] * s[start] ** 2
+    return 2.0 * q_nonzero + q_zero
+
+
 def _contract_4body(
-    fc: jnp.ndarray,
-    T: jnp.ndarray,
+    gn: jnp.ndarray,
     pair_mask: jnp.ndarray,
     cos_theta: jnp.ndarray,
     coef: jnp.ndarray,
@@ -141,13 +196,11 @@ def _contract_4body(
 ) -> jnp.ndarray:
     """4-body contraction over 3 distinct neighbors.
 
-    q_n = coef_scalar * sum_{j,k,l distinct} fc_j*fc_k*fc_l
-          * T_n(s_j)*T_n(s_k)*T_n(s_l)
+    q_n = coef_scalar * sum_{j,k,l distinct} gn_jn * gn_kn * gn_ln
           * P_L(cos JK) * P_L(cos JL) * P_L(cos KL)
 
     Args:
-        fc: (M,) cutoff values.
-        T: (M, n_max+1) Chebyshev polynomials.
+        gn: (M, n_max+1) angular weights.
         pair_mask: (M, M) mask, valid and j != k.
         cos_theta: (M, M) pairwise cosine angles.
         coef: (5,) C4B or C4B2 coefficients.
@@ -157,7 +210,7 @@ def _contract_4body(
     Returns:
         (n_max+1,) 4-body descriptor.
     """
-    M = T.shape[0]
+    M = gn.shape[0]
     P_L = _legendre_all(cos_theta, L_val)[:, :, L_val]  # (M, M)
 
     # 3-neighbor mask: all pairs distinct
@@ -169,8 +222,7 @@ def _contract_4body(
 
     coef_scalar = jnp.sum(coef)
 
-    # Precompute fc * T for all n: (M, n_max+1)
-    G = fc[:, None] * T  # (M, n_max+1)
+    G = gn  # (M, n_max+1)
 
     result = jnp.zeros(n_max + 1)
     for n in range(n_max + 1):
@@ -193,8 +245,7 @@ def _contract_4body(
 
 
 def _contract_5body(
-    fc: jnp.ndarray,
-    T: jnp.ndarray,
+    gn: jnp.ndarray,
     pair_mask: jnp.ndarray,
     cos_theta: jnp.ndarray,
     coef: jnp.ndarray,
@@ -204,12 +255,11 @@ def _contract_5body(
     """5-body contraction over 4 distinct neighbors.
 
     q_n = coef_scalar * sum_{j,k,l,m distinct}
-          fc_j*fc_k*fc_l*fc_m * T_nj*T_nk*T_nl*T_nm
+          gn_jn * gn_kn * gn_ln * gn_mn
           * angular_factors(j,k,l,m)
 
     Args:
-        fc: (M,) cutoff values.
-        T: (M, n_max+1) Chebyshev polynomials.
+        gn: (M, n_max+1) angular weights.
         pair_mask: (M, M) mask, valid and j != k.
         cos_theta: (M, M) pairwise cosine angles.
         coef: C5B (3,) or C5B2 (10,) coefficients.
@@ -219,7 +269,7 @@ def _contract_5body(
     Returns:
         (n_max+1,) 5-body descriptor.
     """
-    M = T.shape[0]
+    M = gn.shape[0]
     P_L = _legendre_all(cos_theta, L_val)[:, :, L_val]  # (M, M)
 
     # 4-neighbor mask: all 4 indices distinct (6 pairwise checks)
@@ -234,7 +284,7 @@ def _contract_5body(
 
     coef_scalar = jnp.sum(coef)
 
-    G = fc[:, None] * T  # (M, n_max+1)
+    G = gn  # (M, n_max+1)
 
     result = jnp.zeros(n_max + 1)
     for n in range(n_max + 1):
@@ -276,77 +326,80 @@ def compute_angular_descriptor(
     has_q_112: int,
     has_q_1122: int,
 ) -> jnp.ndarray:
-    """Compute angular descriptor with C3B/C4B/C5B contraction.
+    """Compute angular descriptor with real spherical-harmonic accumulation.
 
     Returns: flat 1D array.
-        dim = (n_max+1) * num_L + flag_count * (n_max+1)
+        dim = (n_max+1) * L_max + flag_count * (n_max+1)
     """
     M = R_neighbors.shape[0]
     rc = rc_angular
 
-    # Per-neighbor quantities: (M,)
-    r_ij_vec = R_neighbors - R_i  # (M, 3)
-    r_ij = jnp.linalg.norm(r_ij_vec, axis=-1)  # (M,)
+    r_ij_vec = R_neighbors - R_i
+    r_ij = jnp.linalg.norm(r_ij_vec, axis=-1)
     valid = (r_ij < rc) & (r_ij >= 1e-10)
 
-    s_ij = 2.0 * r_ij / rc - 1.0
-    T_all = chebyshev_polynomials(s_ij, n_max)  # (M, n_max+1)
-    fc_all = cosine_cutoff(r_ij, rc)            # (M,)
+    # Shifted Chebyshev basis
+    y = r_ij / rc
+    x = 2.0 * (y - 1.0) ** 2 - 1.0
+    T = chebyshev_polynomials(x, basis_size)
+    basis = (T + 1.0) / 2.0 * cosine_cutoff(r_ij, rc)[:, None]
 
-    # Pairwise quantities: (M, M)
+    # Angular weights gn (incorporate c_angular, iterating over neighbor types)
+    gn = jnp.zeros((M, n_max + 1))
+    for tj in range(c_angular.shape[0]):
+        mask = (types_neighbors == tj)
+        basis_masked = jnp.where(mask[:, None], basis, 0.0)
+        c_t = c_angular[tj]
+        gn += jnp.einsum('mk,nk->mn', basis_masked, c_t)
+    gn = jnp.where(valid[:, None], gn, 0.0)
+
+    # Normalized directions
+    x_dir = jnp.where(valid, r_ij_vec[:, 0] / r_ij, 0.0)
+    y_dir = jnp.where(valid, r_ij_vec[:, 1] / r_ij, 0.0)
+    z_dir = jnp.where(valid, r_ij_vec[:, 2] / r_ij, 0.0)
+
+    from diffcg.nep.constants import Z_COEFFICIENTS
+
+    num_s_terms = (L_max + 1) ** 2 - 1
+    s_all = jnp.zeros((n_max + 1, num_s_terms))
+
+    for L in range(1, L_max + 1):
+        Z_L = Z_COEFFICIENTS[L - 1]
+        start = L * L - 1
+        count = 2 * L + 1
+        for n in range(n_max + 1):
+            s_slice = _accumulate_s_one_jax(x_dir, y_dir, z_dir, gn[:, n], L, Z_L)
+            s_all = s_all.at[n, start:start + count].add(s_slice)
+
+    # 3-body invariants (GPUMD ordering: outer L, inner n)
+    q_3body = jnp.zeros((n_max + 1) * L_max)
+    idx = 0
+    for L in range(1, L_max + 1):
+        for n in range(n_max + 1):
+            q_val = _find_q_one_jax(s_all[n], L)
+            q_3body = q_3body.at[idx].set(q_val)
+            idx += 1
+
+    parts = [q_3body]
+
+    # Pairwise quantities for 4-body/5-body terms
     dot_prods = jnp.einsum("jd,kd->jk", r_ij_vec, r_ij_vec)
     r_prods = r_ij[:, None] * r_ij[None, :]
     cos_theta = jnp.where(r_prods > 1e-20, dot_prods / r_prods, 0.0)
     cos_theta = jnp.clip(cos_theta, -1.0, 1.0)
-
     pair_mask = valid[:, None] * valid[None, :] * (1.0 - jnp.eye(M))
-    fc_pair = fc_all[:, None] * fc_all[None, :]  # (M, M)
-
-    # Legendre polynomials for all orders at once: (M, M, L_max+1)
-    P_all = _legendre_all(cos_theta, L_max)
-
-    # === 3-body contraction (always present) ===
-    dim_3body = (n_max + 1) * num_L
-    q_3body = jnp.zeros(dim_3body)
-    idx = 0
-    for n in range(n_max + 1):
-        T_pair = T_all[:, n, None] * T_all[None, :, n]  # (M, M)
-        base_contrib = pair_mask * fc_pair * T_pair  # (M, M)
-        for l in range(num_L):
-            if l == 0:
-                # P_0 = 1 everywhere, no C3B weight
-                contrib = base_contrib
-            elif l <= L_max:
-                P_l = P_all[:, :, l]  # (M, M)
-                c3b_start, c3b_count = _C3B_L_MAP[l - 1]
-                c3b_entries = C3B[c3b_start:c3b_start + c3b_count]
-                c3b_weight = jnp.sum(jnp.abs(c3b_entries)) / c3b_count
-                contrib = base_contrib * P_l * c3b_weight
-            else:
-                # L > L_max: use identity weight, no C3B for this L
-                P_l = P_all[:, :, L_max]
-                contrib = base_contrib * P_l
-            q_3body = q_3body.at[idx].set(jnp.sum(contrib))
-            idx += 1
-
-    # === 4-body and 5-body terms ===
-    parts = [q_3body]
 
     if has_q_222:
-        q_4b = _contract_4body(fc_all, T_all, pair_mask, cos_theta, C4B, L_val=2, n_max=n_max)
+        q_4b = _contract_4body(gn, pair_mask, cos_theta, C4B, L_val=2, n_max=n_max)
         parts.append(q_4b)
-
     if has_q_1111:
-        q_4b2 = _contract_4body(fc_all, T_all, pair_mask, cos_theta, C4B2, L_val=1, n_max=n_max)
+        q_4b2 = _contract_4body(gn, pair_mask, cos_theta, C4B2, L_val=1, n_max=n_max)
         parts.append(q_4b2)
-
-    # 5-body terms
     if has_q_112:
-        q_5b = _contract_5body(fc_all, T_all, pair_mask, cos_theta, C5B, L_val=1, n_max=n_max)
+        q_5b = _contract_5body(gn, pair_mask, cos_theta, C5B, L_val=1, n_max=n_max)
         parts.append(q_5b)
-
     if has_q_1122:
-        q_5b2 = _contract_5body(fc_all, T_all, pair_mask, cos_theta, C5B2, L_val=2, n_max=n_max)
+        q_5b2 = _contract_5body(gn, pair_mask, cos_theta, C5B2, L_val=2, n_max=n_max)
         parts.append(q_5b2)
 
     return jnp.concatenate(parts)
@@ -374,6 +427,7 @@ def _per_atom_descriptor(
     has_q_112: int,
     has_q_1122: int,
     q_scaler: jnp.ndarray,
+    cell: jnp.ndarray,
     N: int,
 ) -> jnp.ndarray:
     """Compute descriptor for a single atom. Compatible with vmap."""
@@ -381,18 +435,26 @@ def _per_atom_descriptor(
     R_nbr = R_extended[nbr_idx]
     types_nbr = Z_extended[nbr_idx]
 
+    # Apply MIC only to valid neighbors; skip ghost
+    dr = R_nbr - R_i
+    cell_inv = jnp.linalg.inv(cell)
+    dr_frac = dr @ cell_inv.T
+    dr_frac = dr_frac - jnp.round(dr_frac)
+    dr_mic = dr_frac @ cell.T
+    R_nbr_mic = jnp.where(nbr_mask[:, None], R_i + dr_mic, R_nbr)
+
     q_radial = compute_radial_descriptor(
-        R_i, R_nbr, types_nbr, t_i,
+        R_i, R_nbr_mic, types_nbr, t_i,
         c_radial_params[t_i], rc_radial[t_i],
         n_max_radial, basis_size_radial,
     )
     q_angular = compute_angular_descriptor(
-        R_i, R_nbr, types_nbr, t_i,
+        R_i, R_nbr_mic, types_nbr, t_i,
         c_angular_params[t_i], rc_angular[t_i],
         n_max_angular, basis_size_angular, num_L, L_max,
         has_q_222, has_q_1111, has_q_112, has_q_1122,
     )
-    return jnp.concatenate([q_radial, q_angular]) / q_scaler
+    return jnp.concatenate([q_radial, q_angular]) * q_scaler
 
 
 def compute_nep_descriptor(
@@ -425,7 +487,10 @@ def compute_nep_descriptor(
     N = positions.shape[0]
     num_types = rc_radial.shape[0]
     flag_count = has_q_222 + has_q_1111 + has_q_112 + has_q_1122
-    dim = (n_max_radial + 1) + (n_max_angular + 1) * num_L + flag_count * (n_max_angular + 1)
+    # GPUMD: 3-body angular uses l=1..L_max (L_max terms per n), not l=0..L_max
+    angular_3body_dim = (n_max_angular + 1) * L_max
+    angular_extra_dim = flag_count * (n_max_angular + 1)
+    dim = (n_max_radial + 1) + angular_3body_dim + angular_extra_dim
 
     # Reshape c_descriptor into per-type-pair arrays (static Python loop)
     radial_param_size = (n_max_radial + 1) * (basis_size_radial + 1)
@@ -470,7 +535,7 @@ def compute_nep_descriptor(
             basis_size_radial, basis_size_angular,
             num_L, L_max,
             has_q_222, has_q_1111, has_q_112, has_q_1122,
-            q_scaler, N,
+            q_scaler, cell, N,
         )
         return carry, desc_i
 

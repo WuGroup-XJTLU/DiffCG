@@ -22,7 +22,7 @@ MINIMAL_NEP = {
     "L_max": 2, "has_q_222": 0, "has_q_1111": 0,
     "has_q_112": 0, "has_q_1122": 0,
     "num_neurons": 10,
-    "num_L": 3, "dim": 9,
+    "num_L": 2, "dim": 9,
     "descriptor_params": jnp.zeros(75, dtype=jnp.float32),
     "ann_params": {0: {
         "w0": jnp.zeros((10, 9), dtype=jnp.float32),

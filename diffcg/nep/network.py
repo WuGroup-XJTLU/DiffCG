@@ -12,8 +12,9 @@ def apply_nep_network(
     b1: float,
 ) -> jnp.ndarray:
     """Compute energy of one atom. q: (dim,), returns scalar energy in eV."""
-    hidden = jnp.tanh(w0 @ q + b0)
-    return jnp.dot(w1, hidden) + b1
+    # GPUMD convention: tanh(w0@q - b0), energy = sum(w1*tanh) - b1
+    hidden = jnp.tanh(w0 @ q - b0)
+    return jnp.dot(w1, hidden) - b1
 
 
 def apply_nep_network_batch(
@@ -38,7 +39,8 @@ def apply_nep_network_batch(
         mask_f = mask.astype(descriptors.dtype)  # (N,) float
 
         # Apply network to all atoms, then mask by type
-        hidden = jnp.tanh(descriptors @ ap["w0"].T + ap["b0"])  # (N, neurons)
-        e_all = hidden @ ap["w1"] + b1  # (N,)
+        # GPUMD convention: tanh(w0@q - b0), energy = sum(w1*tanh) - b1
+        hidden = jnp.tanh(descriptors @ ap["w0"].T - ap["b0"])  # (N, neurons)
+        e_all = hidden @ ap["w1"] - b1  # (N,)
         energies = energies + mask_f * e_all
     return energies

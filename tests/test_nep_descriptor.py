@@ -54,8 +54,8 @@ def test_angular_descriptor_two_neighbors():
         n_max=1, basis_size=2, num_L=3, L_max=2,
         has_q_222=0, has_q_1111=0, has_q_112=0, has_q_1122=0,
     )
-    # angular dim = (n_max+1) * num_L = 2 * 3 = 6
-    assert q.shape == (6,)
+    # angular dim = (n_max+1) * L_max = 2 * 2 = 4
+    assert q.shape == (4,)
 
 
 def test_legendre():
@@ -126,7 +126,8 @@ def test_contract_4body_basic():
         [0.5, 0.5, 0.0],
     ])
 
-    q = _contract_4body(fc, T, pair_mask, cos_theta, C4B, L_val=2, n_max=n_max)
+    gn = fc[:, None] * T
+    q = _contract_4body(gn, pair_mask, cos_theta, C4B, L_val=2, n_max=n_max)
     assert q.shape == (n_max + 1,)
     # With all-positive contributions, result should be non-zero
     assert jnp.all(q != 0.0)
@@ -141,7 +142,8 @@ def test_contract_4body_distinct_mask():
     pair_mask = 1.0 - jnp.eye(M)
     cos_theta = jnp.array([[0.0, 0.5], [0.5, 0.0]])
 
-    q = _contract_4body(fc, T, pair_mask, cos_theta, C4B, L_val=2, n_max=n_max)
+    gn = fc[:, None] * T
+    q = _contract_4body(gn, pair_mask, cos_theta, C4B, L_val=2, n_max=n_max)
     assert q.shape == (n_max + 1,)
     # With M=2, can't form 3 distinct neighbors: mask_3 should zero everything
     assert jnp.allclose(q, 0.0)
@@ -187,7 +189,7 @@ def test_angular_descriptor_jit_grad():
     )
 
     q_jit = jax.jit(fn)(R_i)
-    assert q_jit.shape == ((n_max + 1) * num_L,)
+    assert q_jit.shape == ((n_max + 1) * 2,)
 
     grad_fn = jax.grad(lambda ri: jnp.sum(fn(ri)))
     g = jax.jit(grad_fn)(R_i)
@@ -214,7 +216,7 @@ def test_angular_descriptor_with_4body_flags():
         n_max=n_max, basis_size=2, num_L=num_L, L_max=2,
         has_q_222=1, has_q_1111=0, has_q_112=0, has_q_1122=0,
     )
-    expected_dim = (n_max + 1) * num_L + (n_max + 1)
+    expected_dim = (n_max + 1) * 2 + (n_max + 1)
     assert q.shape == (expected_dim,)
 
     # has_q_222=1, has_q_1111=1 adds 4 entries
@@ -224,7 +226,7 @@ def test_angular_descriptor_with_4body_flags():
         n_max=n_max, basis_size=2, num_L=num_L, L_max=2,
         has_q_222=1, has_q_1111=1, has_q_112=0, has_q_1122=0,
     )
-    expected_dim2 = (n_max + 1) * num_L + 2 * (n_max + 1)
+    expected_dim2 = (n_max + 1) * 2 + 2 * (n_max + 1)
     assert q2.shape == (expected_dim2,)
 
 
@@ -249,8 +251,8 @@ def test_angular_descriptor_all_flags_jit():
     )
 
     q = jax.jit(fn)(R_i)
-    # 3-body: 6 + 4*(2) = 14
-    assert q.shape == (14,)
+    # 3-body: 4 + 4*(2) = 12
+    assert q.shape == (12,)
 
     grad_fn = jax.grad(lambda ri: jnp.sum(fn(ri)))
     g = jax.jit(grad_fn)(R_i)
@@ -260,9 +262,9 @@ def test_angular_descriptor_all_flags_jit():
 def test_descriptor_shape_consistency():
     """Descriptor output dimensions match computed dim."""
     n_max_radial, n_max_angular = 2, 1
-    num_L = 3
+    L_max = 2
     flag_count = 1  # has_q_222
-    expected_dim = (n_max_radial + 1) + (n_max_angular + 1) * num_L + flag_count * (n_max_angular + 1)
+    expected_dim = (n_max_radial + 1) + (n_max_angular + 1) * L_max + flag_count * (n_max_angular + 1)
 
     c_angular = jnp.ones((1, n_max_angular + 1, 3))
     R_i = jnp.array([0.0, 0.0, 0.0])
@@ -275,7 +277,7 @@ def test_descriptor_shape_consistency():
     q_angular = compute_angular_descriptor(
         R_i, R_nbr, types_nbr, 0,
         c_angular, rc_angular=3.0,
-        n_max=n_max_angular, basis_size=2, num_L=num_L, L_max=2,
+        n_max=n_max_angular, basis_size=2, num_L=3, L_max=L_max,
         has_q_222=1, has_q_1111=0, has_q_112=0, has_q_1122=0,
     )
-    assert q_angular.shape[0] == (n_max_angular + 1) * num_L + flag_count * (n_max_angular + 1)
+    assert q_angular.shape[0] == (n_max_angular + 1) * L_max + flag_count * (n_max_angular + 1)
