@@ -46,9 +46,9 @@ def test_read_nep_metadata():
     assert result["has_q_222"] == 0
     assert result["has_q_1111"] == 0
     assert result["num_neurons"] == 1
-    # First float value = 1.0
-    assert jnp.isclose(result["descriptor_params"][0], jnp.float32(1.0))
-    assert jnp.isclose(result["descriptor_params"][1], jnp.float32(2.0))
+    # With GPUMD order: ANN params first (5), then descriptor (2), then q_scaler (2)
+    assert jnp.isclose(result["descriptor_params"][0], jnp.float32(6.0))
+    assert jnp.isclose(result["descriptor_params"][1], jnp.float32(7.0))
 
 
 def test_read_write_roundtrip():
