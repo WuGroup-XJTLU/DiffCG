@@ -147,15 +147,18 @@ def _accumulate_s_one_jax(x, y, z, gn, L, Z_COEFF_L):
     M = x.shape[0]
     z_pow = jnp.stack([z ** p for p in range(L + 1)], axis=0)  # (L+1, M)
 
-    # Complex powers (x + i*y)^p for p=1..L
-    rp = [x]
-    ip = [y]
-    for p in range(1, L):
-        rp_prev, ip_prev = rp[-1], ip[-1]
-        rp.append(rp_prev * x - ip_prev * y)
-        ip.append(rp_prev * y + ip_prev * x)
-    rp = jnp.stack(rp, axis=0)  # (L, M)
-    ip = jnp.stack(ip, axis=0)  # (L, M)
+    # Complex powers (x + i*y)^p for p=1..L via scan recurrence
+    def _complex_power_step(carry, _):
+        rp_prev, ip_prev = carry
+        rp_next = rp_prev * x - ip_prev * y
+        ip_next = rp_prev * y + ip_prev * x
+        return (rp_next, ip_next), (rp_next, ip_next)
+
+    (_, _), (rp_stack, ip_stack) = jax.lax.scan(
+        _complex_power_step, (x, y), None, length=L - 1
+    )
+    rp = jnp.concatenate([x[None, :], rp_stack], axis=0)  # (L, M)
+    ip = jnp.concatenate([y[None, :], ip_stack], axis=0)  # (L, M)
 
     s = jnp.zeros(2 * L + 1)
     for n1 in range(L + 1):
@@ -430,12 +433,12 @@ def _per_atom_descriptor(
     cell: jnp.ndarray,
     N: int,
 ) -> jnp.ndarray:
-    """Compute descriptor for a single atom. Compatible with vmap."""
+    """Compute descriptor for a single atom with fused radial+angular pathways."""
     nbr_idx = jnp.where(nbr_mask, nbr_idx, N)  # pad with ghost
     R_nbr = R_extended[nbr_idx]
     types_nbr = Z_extended[nbr_idx]
 
-    # Apply MIC only to valid neighbors; skip ghost
+    # --- Apply MIC only to valid neighbors; skip ghost ---
     dr = R_nbr - R_i
     cell_inv = jnp.linalg.inv(cell)
     dr_frac = dr @ cell_inv.T
@@ -443,17 +446,130 @@ def _per_atom_descriptor(
     dr_mic = dr_frac @ cell.T
     R_nbr_mic = jnp.where(nbr_mask[:, None], R_i + dr_mic, R_nbr)
 
-    q_radial = compute_radial_descriptor(
-        R_i, R_nbr_mic, types_nbr, t_i,
-        c_radial_params[t_i], rc_radial[t_i],
-        n_max_radial, basis_size_radial,
+    r_ij_vec = R_nbr_mic - R_i  # (M, 3)
+    r_ij = jnp.linalg.norm(r_ij_vec, axis=-1)  # (M,)
+
+    rc_r = rc_radial[t_i]
+    rc_a = rc_angular[t_i]
+
+    # --- Chebyshev basis (shared when cutoffs match) ---
+    same_rc = rc_r == rc_a
+    pred = jnp.all(same_rc)
+
+    max_basis = max(basis_size_radial, basis_size_angular)
+
+    def _shared_path(_):
+        y = r_ij / rc_r
+        x = 2.0 * (y - 1.0) ** 2 - 1.0
+        T_full = chebyshev_polynomials(x, max_basis)
+        T_shifted = (T_full + 1.0) / 2.0  # (M, max_basis+1)
+        fc = cosine_cutoff(r_ij, rc_r)
+        return T_shifted, fc, T_shifted, fc
+
+    def _separate_path(_):
+        y_r = r_ij / rc_r
+        x_r = 2.0 * (y_r - 1.0) ** 2 - 1.0
+        T_r = chebyshev_polynomials(x_r, basis_size_radial)
+        T_r_shifted = (T_r + 1.0) / 2.0
+        fc_r = cosine_cutoff(r_ij, rc_r)
+        # Pad to max_basis+1 so shapes match shared path
+        pad_r = max_basis - basis_size_radial
+        if pad_r > 0:
+            T_r_shifted = jnp.pad(T_r_shifted, ((0, 0), (0, pad_r)))
+
+        y_a = r_ij / rc_a
+        x_a = 2.0 * (y_a - 1.0) ** 2 - 1.0
+        T_a = chebyshev_polynomials(x_a, basis_size_angular)
+        T_a_shifted = (T_a + 1.0) / 2.0
+        fc_a = cosine_cutoff(r_ij, rc_a)
+        pad_a = max_basis - basis_size_angular
+        if pad_a > 0:
+            T_a_shifted = jnp.pad(T_a_shifted, ((0, 0), (0, pad_a)))
+        return T_r_shifted, fc_r, T_a_shifted, fc_a
+
+    T_r_shifted, fc_r, T_a_shifted, fc_a = jax.lax.cond(
+        pred, _shared_path, _separate_path, operand=None
     )
-    q_angular = compute_angular_descriptor(
-        R_i, R_nbr_mic, types_nbr, t_i,
-        c_angular_params[t_i], rc_angular[t_i],
-        n_max_angular, basis_size_angular, num_L, L_max,
-        has_q_222, has_q_1111, has_q_112, has_q_1122,
-    )
+
+    # --- Radial pathway ---
+    c_radial_ti = c_radial_params[t_i]  # (num_types, n_max_radial+1, basis_size_radial+1)
+    q_radial = jnp.zeros(n_max_radial + 1)
+    for tj in range(c_radial_ti.shape[0]):
+        mask = (types_nbr == tj)
+        T_r_masked = jnp.where(mask[:, None],
+                                T_r_shifted[:, :basis_size_radial + 1], 0.0)
+        fc_r_masked = jnp.where(mask, fc_r, 0.0)
+        c_t = c_radial_ti[tj]  # (n_max_radial+1, basis_size_radial+1)
+        q_radial += jnp.einsum('mk,nk,m->n', T_r_masked, c_t, fc_r_masked)
+
+    # --- Angular pathway ---
+    valid = (r_ij < rc_a) & (r_ij >= 1e-10)
+
+    # Angular basis with cutoff
+    basis_angular = T_a_shifted[:, :basis_size_angular + 1] * fc_a[:, None]  # (M, basis+1)
+
+    # gn weights
+    c_angular_ti = c_angular_params[t_i]  # (num_types, n_max_angular+1, basis_size_angular+1)
+    M = r_ij.shape[0]
+    gn = jnp.zeros((M, n_max_angular + 1))
+    for tj in range(c_angular_ti.shape[0]):
+        mask = (types_nbr == tj)
+        basis_masked = jnp.where(mask[:, None], basis_angular, 0.0)
+        c_t = c_angular_ti[tj]
+        gn += jnp.einsum('mk,nk->mn', basis_masked, c_t)
+    gn = jnp.where(valid[:, None], gn, 0.0)
+
+    # Normalized directions
+    x_dir = jnp.where(valid, r_ij_vec[:, 0] / r_ij, 0.0)
+    y_dir = jnp.where(valid, r_ij_vec[:, 1] / r_ij, 0.0)
+    z_dir = jnp.where(valid, r_ij_vec[:, 2] / r_ij, 0.0)
+
+    from diffcg.nep.constants import Z_COEFFICIENTS
+
+    # Accumulate spherical harmonics (L-outer, n-inner)
+    num_s_terms = (L_max + 1) ** 2 - 1
+    s_all = jnp.zeros((n_max_angular + 1, num_s_terms))
+
+    for L in range(1, L_max + 1):
+        Z_L = Z_COEFFICIENTS[L - 1]
+        start = L * L - 1
+        count = 2 * L + 1
+        for n in range(n_max_angular + 1):
+            s_slice = _accumulate_s_one_jax(x_dir, y_dir, z_dir, gn[:, n], L, Z_L)
+            s_all = s_all.at[n, start:start + count].add(s_slice)
+
+    # 3-body invariants (GPUMD ordering: outer L, inner n)
+    q_3body = jnp.zeros((n_max_angular + 1) * L_max)
+    idx = 0
+    for L in range(1, L_max + 1):
+        for n in range(n_max_angular + 1):
+            q_val = _find_q_one_jax(s_all[n], L)
+            q_3body = q_3body.at[idx].set(q_val)
+            idx += 1
+
+    parts = [q_3body]
+
+    # Pairwise quantities for 4-body/5-body terms
+    dot_prods = jnp.einsum("jd,kd->jk", r_ij_vec, r_ij_vec)
+    r_prods = r_ij[:, None] * r_ij[None, :]
+    cos_theta = jnp.where(r_prods > 1e-20, dot_prods / r_prods, 0.0)
+    cos_theta = jnp.clip(cos_theta, -1.0, 1.0)
+    pair_mask = valid[:, None] * valid[None, :] * (1.0 - jnp.eye(M))
+
+    if has_q_222:
+        q_4b = _contract_4body(gn, pair_mask, cos_theta, C4B, L_val=2, n_max=n_max_angular)
+        parts.append(q_4b)
+    if has_q_1111:
+        q_4b2 = _contract_4body(gn, pair_mask, cos_theta, C4B2, L_val=1, n_max=n_max_angular)
+        parts.append(q_4b2)
+    if has_q_112:
+        q_5b = _contract_5body(gn, pair_mask, cos_theta, C5B, L_val=1, n_max=n_max_angular)
+        parts.append(q_5b)
+    if has_q_1122:
+        q_5b2 = _contract_5body(gn, pair_mask, cos_theta, C5B2, L_val=2, n_max=n_max_angular)
+        parts.append(q_5b2)
+
+    q_angular = jnp.concatenate(parts)
     return jnp.concatenate([q_radial, q_angular]) * q_scaler
 
 
