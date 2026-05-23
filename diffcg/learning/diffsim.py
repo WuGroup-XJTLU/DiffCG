@@ -734,9 +734,12 @@ def init_diffsim(
         _, obs_per_frame = jax.lax.scan(body_fn, nbrs, all_R)
         return obs_per_frame
 
-    @jax.jit
-    def _precompute_observables_jit(all_R, z, cell, nbrs, sp, energy_fn):
-        """JIT-compiled scan over frames computing all observables. No gradient tracking."""
+    def _precompute_observables(all_R, z, cell, nbrs, sp, energy_fn):
+        """Scan over frames computing all observables. No gradient tracking.
+
+        Called once per trajectory change (not JIT'd since sp contains function
+        attributes that can't be traced as explicit parameters).
+        """
         def body_fn(nbrs_carry, R_i):
             nbrs_i = sp.neighbor_fn.update(R_i, nbrs_carry)
             system_i = System(R=R_i, Z=z, cell=cell)
@@ -822,7 +825,7 @@ def init_diffsim(
                 capacity_multiplier=1.25,
                 custom_mask_function=_custom_mask_function,
             )
-            obs_full = _precompute_observables_jit(
+            obs_full = _precompute_observables(
                 all_R_obs, z_obs, cell_obs, nbrs_obs, sp_obs, energy_fn_cache,
             )
             _obs_cache = (traj_id, obs_full)
