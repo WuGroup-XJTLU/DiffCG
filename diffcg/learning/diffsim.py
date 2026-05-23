@@ -621,6 +621,7 @@ def init_diffsim(
 
     _rerun_nbrs = None
     _rerun_sp = None
+    _obs_cache = None  # (traj_id, obs_per_frame) — invalidated when trajectory changes
 
     def _subsample_all_R(all_R):
         """Uniformly subsample frames if trajectory exceeds max_frames."""
@@ -730,6 +731,19 @@ def init_diffsim(
                 obs_i[qkey] = qspec['compute_fn'](system_i, energy_fn=energy_fn, neighbors=nbrs_i)
             return nbrs_i, obs_i
 
+        _, obs_per_frame = jax.lax.scan(body_fn, nbrs, all_R)
+        return obs_per_frame
+
+    @jax.jit
+    def _precompute_observables_jit(all_R, z, cell, nbrs, sp, energy_fn):
+        """JIT-compiled scan over frames computing all observables. No gradient tracking."""
+        def body_fn(nbrs_carry, R_i):
+            nbrs_i = sp.neighbor_fn.update(R_i, nbrs_carry)
+            system_i = System(R=R_i, Z=z, cell=cell)
+            obs_i = {}
+            for qkey, qspec in state['quantity_dict'].items():
+                obs_i[qkey] = qspec['compute_fn'](system_i, energy_fn=energy_fn, neighbors=nbrs_i)
+            return nbrs_i, obs_i
         _, obs_per_frame = jax.lax.scan(body_fn, nbrs, all_R)
         return obs_per_frame
 
