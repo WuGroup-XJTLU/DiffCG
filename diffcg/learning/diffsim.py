@@ -779,7 +779,7 @@ def init_diffsim(
           2. Compute weighted loss + gradient (observables computed inside value_and_grad)
           3. Update params
         """
-        nonlocal _rerun_nbrs, _rerun_sp
+        nonlocal _rerun_nbrs, _rerun_sp, _obs_cache
         step = _step_counter[0]
         sampler_params = state['sampler_params']
 
@@ -807,18 +807,41 @@ def init_diffsim(
         trajs = traj_state['trajs']
         ref_energies = traj_state['ref_energies']
 
+        # --- Precompute observables if trajectory changed or first call ---
+        traj_id = id(trajs)
+        if _obs_cache is None or _obs_cache[0] != traj_id:
+            all_R_obs = trajs.positions.astype(jnp.float32)
+            z_obs = trajs.Z.astype(jnp.int16)
+            cell_obs = trajs.cell.astype(jnp.float32) if trajs.cell is not None else None
+            r_cut = state.get('r_cut', 1.0)
+
+            energy_fn_cache = build_energy_fn_with_params_fn(params, max_num_atoms=max_num_atoms)
+
+            nbrs_obs, sp_obs = jaxmd_neighbor_list(
+                positions=all_R_obs[0], cell=cell_obs, cutoff=r_cut,
+                capacity_multiplier=1.25,
+                custom_mask_function=_custom_mask_function,
+            )
+            obs_full = _precompute_observables_jit(
+                all_R_obs, z_obs, cell_obs, nbrs_obs, sp_obs, energy_fn_cache,
+            )
+            _obs_cache = (traj_id, obs_full)
+
         # --- Step 2: Compute weighted loss + gradient ---
         kBT = sampler_params['temperature'] * Boltzmann_constant
-        # Apply frame subsampling (consistent indices for positions and energies)
+        # Apply frame subsampling (consistent indices for positions, energies, observables)
         all_R_full = trajs.positions.astype(jnp.float32)
+        obs_full = _obs_cache[1]  # dict of {qkey: (num_frames, ...)}
         if max_frames is not None and all_R_full.shape[0] > max_frames:
             indices = np.random.choice(all_R_full.shape[0], max_frames, replace=False)
             indices = np.sort(indices)  # sort for scan stability
             all_R = all_R_full[indices]
             ref_energies_sub = ref_energies[indices]
+            obs_per_frame = {k: v[indices] for k, v in obs_full.items()}
         else:
             all_R = all_R_full
             ref_energies_sub = ref_energies
+            obs_per_frame = obs_full
 
         z = trajs.Z.astype(jnp.int16)
         cell_arr = trajs.cell.astype(jnp.float32) if trajs.cell is not None else None
@@ -832,7 +855,9 @@ def init_diffsim(
 
         nbrs_for_grad = _rerun_nbrs
         sp_for_grad = _rerun_sp
-        _quantity_dict = state['quantity_dict']
+
+        # Capture precomputed observables for use inside wrapped_loss
+        _obs_cached = obs_per_frame
 
         def wrapped_loss(p):
             energy_fn = build_energy_fn_with_params_fn(p, max_num_atoms=max_num_atoms)
@@ -841,19 +866,16 @@ def init_diffsim(
                 nbrs_i = sp_for_grad.neighbor_fn.update(R_i, nbrs)
                 system_i = System(R=R_i, Z=z, cell=cell_arr)
                 e_i = energy_fn(system_i, nbrs_i)
-                obs_i = {}
-                for qkey, qspec in _quantity_dict.items():
-                    obs_i[qkey] = qspec['compute_fn'](system_i, energy_fn=energy_fn, neighbors=nbrs_i)
-                return nbrs_i, (e_i, obs_i)
+                return nbrs_i, e_i
 
             body_fn_remat = jax.checkpoint(body_fn)
-            _, (energies_new, obs_per_frame) = jax.lax.scan(body_fn_remat, nbrs_for_grad, all_R)
+            _, energies_new = jax.lax.scan(body_fn_remat, nbrs_for_grad, all_R)
 
             log_weights = -(1.0 / kBT) * (energies_new - ref_energies_sub)
             log_weights = log_weights - jnp.max(log_weights)
             prob_ratios = jnp.exp(log_weights)
             weights = prob_ratios / jnp.sum(prob_ratios)
-            loss_val, predictions = loss_fn(obs_per_frame, weights)
+            loss_val, predictions = loss_fn(_obs_cached, weights)
             if regularizer_fn is not None:
                 loss_val = loss_val + regularizer_fn(p)
             return loss_val, predictions
