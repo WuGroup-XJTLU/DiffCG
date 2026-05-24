@@ -643,7 +643,7 @@ def init_diffsim(
         # Allocate neighbor list once (reuse across calls if possible)
         if _rerun_nbrs is None or _rerun_sp is None:
             _rerun_nbrs, _rerun_sp = jaxmd_neighbor_list(
-                positions=all_R[0], cell=cell, cutoff=r_cut, capacity_multiplier=1.25,
+                positions=all_R[0], cell=cell, cutoff=r_cut, capacity_multiplier=2.0,
                 custom_mask_function=_custom_mask_function,
             )
 
@@ -766,7 +766,7 @@ def init_diffsim(
 
         if _rerun_nbrs is None or _rerun_sp is None:
             _rerun_nbrs, _rerun_sp = jaxmd_neighbor_list(
-                positions=all_R[0], cell=cell, cutoff=r_cut, capacity_multiplier=1.25,
+                positions=all_R[0], cell=cell, cutoff=r_cut, capacity_multiplier=2.0,
                 custom_mask_function=_custom_mask_function,
             )
 
@@ -822,7 +822,7 @@ def init_diffsim(
 
             nbrs_obs, sp_obs = jaxmd_neighbor_list(
                 positions=all_R_obs[0], cell=cell_obs, cutoff=r_cut,
-                capacity_multiplier=1.25,
+                capacity_multiplier=2.0,
                 custom_mask_function=_custom_mask_function,
             )
             obs_full = _precompute_observables(
@@ -852,7 +852,7 @@ def init_diffsim(
         r_cut = state.get('r_cut', 1.0)
         if _rerun_nbrs is None or _rerun_sp is None:
             _rerun_nbrs, _rerun_sp = jaxmd_neighbor_list(
-                positions=all_R[0], cell=cell_arr, cutoff=r_cut, capacity_multiplier=1.25,
+                positions=all_R[0], cell=cell_arr, cutoff=r_cut, capacity_multiplier=2.0,
                 custom_mask_function=_custom_mask_function,
             )
 
